@@ -6,12 +6,14 @@
 #
 
 CC=gcc
-CFLAGS=-Wall -Wextra -std=c99 -fPIC -shared
-ASTERISK_INCLUDE_DIR=../asterisk_context_files
+CFLAGS=-Wall -Wextra -std=c99 -fPIC -shared -I/usr/local/include
+
+# Try to find Asterisk headers in standard locations
+ASTERISK_INCLUDE_DIR=$(shell if [ -d "/usr/include/asterisk" ]; then echo "/usr/include"; elif [ -d "../asterisk_context_files" ]; then echo "../asterisk_context_files"; else echo "/usr/local/include/asterisk"; fi)
 
 # External library dependencies for ElevenLabs integration
 LIBS=-lcurl -lwebsockets -lcjson -lssl -lcrypto -lpthread
-LDFLAGS=-shared $(LIBS)
+LDFLAGS=-shared -L/usr/local/lib $(LIBS)
 
 # Check for required libraries
 CHECK_LIBS=curl libwebsockets cjson openssl
@@ -32,13 +34,52 @@ INTEGRATION_SOURCE=tests/test_integration.c
 all: check-deps $(MODULE)
 
 # Check for required development libraries
-check-deps:
+check-deps: check-asterisk-headers
 	@echo "Checking for required libraries..."
-	@pkg-config --exists libcurl || (echo "ERROR: libcurl-dev not found. Install with: sudo apt-get install libcurl4-openssl-dev" && exit 1)
-	@pkg-config --exists libwebsockets || (echo "ERROR: libwebsockets-dev not found. Install with: sudo apt-get install libwebsockets-dev" && exit 1)
-	@pkg-config --exists libcjson || (echo "ERROR: libcjson-dev not found. Install with: sudo apt-get install libcjson-dev" && exit 1)
-	@pkg-config --exists openssl || (echo "ERROR: openssl-dev not found. Install with: sudo apt-get install libssl-dev" && exit 1)
+	@pkg-config --exists libcurl || (echo "ERROR: libcurl development headers not found." && echo "Install with: sudo yum install libcurl-devel" && exit 1)
+	@pkg-config --exists openssl || (echo "ERROR: openssl development headers not found." && echo "Install with: sudo yum install openssl-devel" && exit 1)
+	@if pkg-config --exists libwebsockets; then \
+		echo "libwebsockets found"; \
+	elif [ -f /usr/local/lib/pkgconfig/libwebsockets.pc ]; then \
+		echo "libwebsockets found (local install)"; \
+	elif [ -f /usr/local/include/libwebsockets.h ]; then \
+		echo "libwebsockets headers found"; \
+	else \
+		echo "ERROR: libwebsockets not found. Run: make install-libwebsockets"; \
+		exit 1; \
+	fi
+	@if pkg-config --exists libcjson; then \
+		echo "cJSON found"; \
+	elif [ -f /usr/local/lib/pkgconfig/libcjson.pc ]; then \
+		echo "cJSON found (local install)"; \
+	elif [ -f /usr/local/include/cjson/cJSON.h ]; then \
+		echo "cJSON headers found"; \
+	else \
+		echo "ERROR: cJSON not found. Run: make install-cjson"; \
+		exit 1; \
+	fi
 	@echo "All required libraries found!"
+
+# Check for Asterisk headers
+check-asterisk-headers:
+	@echo "Checking for Asterisk headers..."
+	@echo "Using include directory: $(ASTERISK_INCLUDE_DIR)"
+	@if [ -f "$(ASTERISK_INCLUDE_DIR)/asterisk.h" ] || [ -f "$(ASTERISK_INCLUDE_DIR)/asterisk/asterisk.h" ]; then \
+		echo "Asterisk headers found"; \
+	else \
+		echo "ERROR: Asterisk headers not found!"; \
+		echo ""; \
+		echo "Options to fix this:"; \
+		echo "1. Install Asterisk development headers:"; \
+		echo "   sudo yum install asterisk-devel"; \
+		echo ""; \
+		echo "2. Or copy the asterisk_context_files directory from the project"; \
+		echo ""; \
+		echo "3. Or specify a custom path:"; \
+		echo "   make ASTERISK_INCLUDE_DIR=/path/to/asterisk/include"; \
+		echo ""; \
+		exit 1; \
+	fi
 
 # Build the module
 $(MODULE): $(SOURCE)
@@ -120,9 +161,21 @@ install-deps:
 	@if command -v apt-get >/dev/null 2>&1; then \
 		sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libwebsockets-dev libcjson-dev libssl-dev; \
 	elif command -v yum >/dev/null 2>&1; then \
-		sudo yum install -y libcurl-devel libwebsockets-devel libcjson-devel openssl-devel; \
+		echo "Installing dependencies for CentOS/RHEL..."; \
+		sudo yum install -y epel-release; \
+		sudo yum install -y libcurl-devel openssl-devel; \
+		echo "Installing libwebsockets from source..."; \
+		$(MAKE) install-libwebsockets; \
+		echo "Installing cJSON from source..."; \
+		$(MAKE) install-cjson; \
 	elif command -v dnf >/dev/null 2>&1; then \
-		sudo dnf install -y libcurl-devel libwebsockets-devel libcjson-devel openssl-devel; \
+		echo "Installing dependencies for Fedora/CentOS 8+..."; \
+		sudo dnf install -y epel-release; \
+		sudo dnf install -y libcurl-devel openssl-devel; \
+		echo "Installing libwebsockets from source..."; \
+		$(MAKE) install-libwebsockets; \
+		echo "Installing cJSON from source..."; \
+		$(MAKE) install-cjson; \
 	elif command -v brew >/dev/null 2>&1; then \
 		brew install curl libwebsockets cjson openssl; \
 	else \
@@ -132,6 +185,30 @@ install-deps:
 		echo "  - libcjson development headers"; \
 		echo "  - OpenSSL development headers"; \
 	fi
+
+# Install libwebsockets from source (for CentOS/RHEL)
+install-libwebsockets:
+	@echo "Building libwebsockets from source..."
+	cd /tmp && \
+	wget -O libwebsockets.tar.gz https://github.com/warmcat/libwebsockets/archive/v4.3.2.tar.gz && \
+	tar -xzf libwebsockets.tar.gz && \
+	cd libwebsockets-4.3.2 && \
+	mkdir build && cd build && \
+	cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DLWS_WITH_SSL=ON && \
+	make && sudo make install && \
+	sudo ldconfig
+
+# Install cJSON from source (for CentOS/RHEL)
+install-cjson:
+	@echo "Building cJSON from source..."
+	cd /tmp && \
+	wget -O cjson.tar.gz https://github.com/DaveGamble/cJSON/archive/v1.7.16.tar.gz && \
+	tar -xzf cjson.tar.gz && \
+	cd cJSON-1.7.16 && \
+	mkdir build && cd build && \
+	cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DENABLE_CJSON_UTILS=On -DENABLE_CJSON_TEST=Off && \
+	make && sudo make install && \
+	sudo ldconfig
 
 # Development targets
 debug: CFLAGS += -g -DDEBUG -O0
