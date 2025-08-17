@@ -25,14 +25,12 @@
 
 #include "asterisk.h"
 
-#include <math.h>
 #include "asterisk/app.h"
 #include "asterisk/module.h"
 #include "asterisk/channel.h"
 #include "asterisk/logger.h"
 #include "asterisk/strings.h"
 #include "asterisk/utils.h"
-#include "asterisk/ulaw.h"
 #include "asterisk/frame.h"
 #include "asterisk/framehook.h"
 #include "asterisk/cli.h"
@@ -149,8 +147,6 @@ struct elevenlabs_session {
 	int playback_running;
 	int session_active;
 	int interruption_pending; /* Flag to immediately stop current playback */
-	double current_vad_score; /* Current VAD score for volume control */
-	float playback_volume; /* Current playback volume multiplier (0.0-1.0) */
 	
 	/* Framehook */
 	int framehook_id;
@@ -432,8 +428,6 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan, struc
 	session->framehook_id = -1;
 	session->session_active = 1;
 	session->interruption_pending = 0;
-	session->current_vad_score = 0.0;
-	session->playback_volume = 1.0; /* Start at full volume */
 	session->current_event_id = 1;
 	session->read_frame_count = 0;
 	session->write_frame_count = 0;
@@ -960,17 +954,6 @@ static void *playback_thread_func(void *arg)
 			
 			memcpy(frame->data.ptr, audio_ptr, chunk_size);
 			
-			/* Apply volume scaling based on VAD score */
-			ast_mutex_lock(&session->session_lock);
-			float volume = session->playback_volume;
-			ast_mutex_unlock(&session->session_lock);
-			
-			/* TODO: Volume scaling disabled due to μ-law distortion issues */
-			/* Need proper μ-law lookup table or linear conversion for quality volume control */
-			if (volume < 1.0f && elevenlabs_debug) {
-				ast_log(LOG_DEBUG, "Volume scaling requested: %.2f (disabled to avoid distortion)\n", volume);
-			}
-			
 			/* Write frame to channel - check if session is still active and channel is valid */
 			ast_mutex_lock(&session->session_lock);
 			int session_ok = session->session_active && session->channel;
@@ -1376,42 +1359,11 @@ static void handle_websocket_message(struct elevenlabs_session *session, const c
 					ast_log(LOG_NOTICE, "Timestamp: %s\n", timestamp_item->valuestring);
 				}
 				
-				/* Update session VAD score and adjust playback volume */
-				ast_mutex_lock(&session->session_lock);
-				session->current_vad_score = score;
-				
-				float target_volume;
-				if (score >= 0.9) {
-					target_volume = 0.25f; /* Reduce to 25% volume when user is speaking strongly */
-					ast_log(LOG_NOTICE, "VERY HIGH voice activity (score=%.3f) - reducing AI playback volume to 25%%\n", score);
-				} else if (score >= 0.7) {
-					target_volume = 0.5f; /* Reduce to 50% volume for moderate voice activity */
-					ast_log(LOG_NOTICE, "HIGH voice activity (score=%.3f) - reducing AI playback volume to 50%%\n", score);
-				} else if (score >= 0.5) {
-					target_volume = 0.75f; /* Reduce to 75% volume for low voice activity */
-					ast_log(LOG_NOTICE, "MODERATE voice activity (score=%.3f) - reducing AI playback volume to 75%%\n", score);
+				if (score > 0.5) {
+					ast_log(LOG_NOTICE, "HIGH voice activity detected (score=%.3f)\n", score);
 				} else {
-					target_volume = 1.0f; /* Full volume when user is not speaking */
-					ast_log(LOG_NOTICE, "LOW voice activity (score=%.3f) - AI playback at full volume\n", score);
+					ast_log(LOG_NOTICE, "LOW voice activity detected (score=%.3f)\n", score);
 				}
-				
-				/* Smooth volume transition to avoid audio pops */
-				if (session->playback_volume != target_volume) {
-					float volume_diff = target_volume - session->playback_volume;
-					if (fabs(volume_diff) > 0.1f) {
-						/* Large volume change - do it gradually */
-						session->playback_volume += (volume_diff > 0) ? 0.1f : -0.1f;
-					} else {
-						/* Small change - set directly */
-						session->playback_volume = target_volume;
-					}
-					ast_log(LOG_NOTICE, "Playback volume adjusted: %.2f → %.2f (target: %.2f)\n", 
-						session->playback_volume - (volume_diff > 0 ? 0.1f : -0.1f), 
-						session->playback_volume, target_volume);
-				}
-				
-				ast_mutex_unlock(&session->session_lock);
-				
 				ast_log(LOG_NOTICE, "=== END VAD SCORE ===\n");
 			} else {
 				ast_log(LOG_WARNING, "vad_score_event missing valid vad_score field\n");
