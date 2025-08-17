@@ -156,6 +156,12 @@ struct elevenlabs_session {
 	int current_event_id;
 	int read_frame_count;
 	int write_frame_count;
+	
+	/* WebSocket message reassembly */
+	char *message_buffer;
+	size_t message_buffer_size;
+	size_t message_buffer_capacity;
+	ast_mutex_t message_buffer_lock;
 };
 
 /*! \brief Global agent configurations */
@@ -199,6 +205,8 @@ static int send_websocket_message(struct elevenlabs_session *session, const char
 static void handle_websocket_message(struct elevenlabs_session *session, const char *message);
 static void send_conversation_initiation(struct elevenlabs_session *session);
 static int send_audio_to_websocket(struct elevenlabs_session *session, const unsigned char *audio_data, size_t length);
+static int add_to_message_buffer(struct elevenlabs_session *session, const char *data, size_t len, int is_final);
+static void process_complete_message(struct elevenlabs_session *session);
 
 /* Base64 encoding */
 static char *base64_encode(const unsigned char *data, size_t input_length);
@@ -418,6 +426,17 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan, struc
 	session->write_frame_count = 0;
 	ast_mutex_init(&session->session_lock);
 	
+	/* Initialize message buffer for WebSocket reassembly */
+	session->message_buffer_capacity = 64 * 1024; /* 64KB buffer for large audio messages */
+	session->message_buffer = ast_calloc(1, session->message_buffer_capacity);
+	if (!session->message_buffer) {
+		ast_log(LOG_ERROR, "Failed to allocate message buffer\n");
+		destroy_session(session);
+		return NULL;
+	}
+	session->message_buffer_size = 0;
+	ast_mutex_init(&session->message_buffer_lock);
+	
 	/* Initialize send buffer based on config */
 	session->send_buffer_duration_ms = config->buffer_duration_ms;
 	/* Calculate buffer capacity: 8kHz * 8-bit μ-law = 8 bytes per ms */
@@ -501,33 +520,44 @@ static void destroy_session(struct elevenlabs_session *session)
 	
 	ast_log(LOG_NOTICE, "Destroying ElevenLabs session\n");
 	
-	/* Mark session as inactive */
+	/* Mark session as inactive first */
+	ast_mutex_lock(&session->session_lock);
 	session->session_active = 0;
+	session->ws_connected = 0;
+	ast_mutex_unlock(&session->session_lock);
 	
-	/* Stop threads */
+	/* Stop WebSocket thread */
 	if (session->websocket_running) {
 		session->websocket_running = 0;
+		ast_log(LOG_NOTICE, "Waiting for WebSocket thread to stop\n");
 		pthread_join(session->websocket_thread, NULL);
+		ast_log(LOG_NOTICE, "WebSocket thread stopped\n");
 	}
 	
+	/* Stop playback thread */
 	if (session->playback_running) {
 		session->playback_running = 0;
 		if (session->receive_queue) {
 			ast_cond_signal(&session->receive_queue->cond);
 		}
+		ast_log(LOG_NOTICE, "Waiting for playback thread to stop\n");
 		pthread_join(session->playback_thread, NULL);
+		ast_log(LOG_NOTICE, "Playback thread stopped\n");
 	}
 	
 	/* Detach framehook */
 	detach_framehook(session);
 	
-	/* Cleanup WebSocket */
+	/* Cleanup WebSocket safely */
 	if (session->ws_connection) {
+		ast_log(LOG_NOTICE, "Closing WebSocket connection\n");
 		lws_close_reason(session->ws_connection, LWS_CLOSE_STATUS_NORMAL, NULL, 0);
 		session->ws_connection = NULL;
+		usleep(100000); /* 100ms delay to allow cleanup */
 	}
 	
 	if (session->ws_context) {
+		ast_log(LOG_NOTICE, "Destroying WebSocket context\n");
 		lws_context_destroy(session->ws_context);
 		session->ws_context = NULL;
 	}
@@ -550,7 +580,14 @@ static void destroy_session(struct elevenlabs_session *session)
 		session->send_buffer = NULL;
 	}
 	
+	/* Cleanup message buffer */
+	if (session->message_buffer) {
+		ast_free(session->message_buffer);
+		session->message_buffer = NULL;
+	}
+	
 	/* Destroy mutexes */
+	ast_mutex_destroy(&session->message_buffer_lock);
 	ast_mutex_destroy(&session->send_buffer_lock);
 	ast_mutex_destroy(&session->session_lock);
 	
@@ -579,11 +616,13 @@ static struct ast_frame *framehook_callback(struct ast_channel *chan, struct ast
 	case AST_FRAMEHOOK_EVENT_READ:
 		/* Incoming audio from caller - buffer and send to ElevenLabs */
 		if (frame->data.ptr && frame->datalen > 0 && session->ws_connected) {
-			/* Log frame details with counter */
-			const char *format_name = ast_format_get_name(frame->subclass.format);
-			session->read_frame_count++;
-			ast_log(LOG_NOTICE, "Framehook READ #%d: %s frame - %d bytes, %d samples\n", 
-				session->read_frame_count, format_name, frame->datalen, frame->samples);
+			/* Log frame details only in debug mode */
+			if (elevenlabs_debug) {
+				const char *format_name = ast_format_get_name(frame->subclass.format);
+				session->read_frame_count++;
+				ast_log(LOG_DEBUG, "Framehook READ #%d: %s frame - %d bytes, %d samples\n", 
+					session->read_frame_count, format_name, frame->datalen, frame->samples);
+			}
 			
 			add_audio_to_send_buffer(session, frame->data.ptr, frame->datalen);
 			if (should_send_buffer(session)) {
@@ -754,7 +793,7 @@ static void *playback_thread_func(void *arg)
 	struct elevenlabs_session *session = arg;
 	struct audio_queue_item *item;
 	struct ast_frame *frame;
-	size_t frame_size = 320; /* 20ms at 8kHz, 16-bit = 320 bytes */
+	size_t frame_size = 160; /* 20ms at 8kHz, μ-law = 160 bytes */
 	unsigned char *audio_ptr;
 	size_t remaining;
 	struct timespec sleep_time;
@@ -784,6 +823,9 @@ static void *playback_thread_func(void *arg)
 			continue;
 		}
 		
+		ast_log(LOG_NOTICE, "Playing audio chunk: %zu bytes (event_id: %d)\n", 
+			item->data_length, item->event_id);
+		
 		/* Split audio data into 20ms frames and play them */
 		audio_ptr = item->audio_data;
 		remaining = item->data_length;
@@ -798,18 +840,32 @@ static void *playback_thread_func(void *arg)
 			}
 			
 			frame->frametype = AST_FRAME_VOICE;
-			frame->subclass.format = ast_channel_readformat(session->channel);
+			frame->subclass.format = ast_format_cache_get("ulaw");
 			frame->data.ptr = frame + 1;
 			frame->datalen = chunk_size;
-			frame->samples = chunk_size / 2; /* 16-bit samples */
+			frame->samples = chunk_size; /* μ-law: 1 byte = 1 sample */
 			
 			memcpy(frame->data.ptr, audio_ptr, chunk_size);
 			
-			/* Write frame to channel */
-			if (ast_write(session->channel, frame) < 0) {
-				ast_log(LOG_WARNING, "Failed to write audio frame\n");
+			/* Write frame to channel - check if session is still active */
+			if (session->session_active && session->channel) {
+				if (ast_write(session->channel, frame) < 0) {
+					ast_log(LOG_WARNING, "Failed to write audio frame to channel\n");
+					/* Stop playback on write error */
+					session->playback_running = 0;
+				} else {
+					ast_log(LOG_NOTICE, "Injected audio frame: %zu bytes, %zu samples\n", 
+						chunk_size, chunk_size);
+				}
+			} else {
+				ast_log(LOG_NOTICE, "Session inactive, stopping audio playback\n");
+				session->playback_running = 0;
 			}
 			
+			/* Release format reference and free frame */
+			if (frame->subclass.format) {
+				ao2_ref(frame->subclass.format, -1);
+			}
 			ast_free(frame);
 			
 			audio_ptr += chunk_size;
@@ -904,6 +960,12 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
 	    reason == LWS_CALLBACK_CLOSED) {
 		if (wsi && lws_get_context(wsi)) {
 			session = (struct elevenlabs_session *)lws_context_user(lws_get_context(wsi));
+			
+			/* Validate session pointer and active state */
+			if (!session || !session->session_active) {
+				ast_log(LOG_WARNING, "WebSocket callback called with invalid or inactive session\n");
+				return -1;
+			}
 		}
 	}
 	
@@ -920,28 +982,37 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
 		break;
 		
 	case LWS_CALLBACK_CLIENT_RECEIVE:
-		if (session && in && len > 0) {
-			char *message = ast_calloc(1, len + 1);
-			if (message) {
-				memcpy(message, in, len);
-				message[len] = '\0';
-				handle_websocket_message(session, message);
-				ast_free(message);
-			}
+		if (session && in && len > 0 && session->session_active) {
+			/* Check if this is the final fragment */
+			int is_final = lws_is_final_fragment(wsi);
+			add_to_message_buffer(session, (char *)in, len, is_final);
 		}
 		break;
 		
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
 		ast_log(LOG_ERROR, "WebSocket connection error\n");
 		if (session) {
+			ast_mutex_lock(&session->session_lock);
 			session->ws_connected = 0;
+			session->websocket_running = 0;
+			session->session_active = 0;
+			ast_mutex_unlock(&session->session_lock);
 		}
 		break;
 		
 	case LWS_CALLBACK_CLOSED:
-		ast_log(LOG_NOTICE, "WebSocket connection closed\n");
+		ast_log(LOG_NOTICE, "WebSocket connection closed by server\n");
 		if (session) {
+			ast_mutex_lock(&session->session_lock);
 			session->ws_connected = 0;
+			session->websocket_running = 0;
+			session->session_active = 0;
+			ast_mutex_unlock(&session->session_lock);
+			
+			/* Signal playback thread to stop */
+			if (session->receive_queue) {
+				ast_cond_signal(&session->receive_queue->cond);
+			}
 		}
 		break;
 		
@@ -976,8 +1047,10 @@ static int send_websocket_message(struct elevenlabs_session *session, const char
 		return -1;
 	}
 	
-	/* Always log sent messages for monitoring */
-	ast_log(LOG_NOTICE, "Sent to ElevenLabs: %s\n", message);
+	/* Log sent messages only in debug mode */
+	if (elevenlabs_debug) {
+		ast_log(LOG_DEBUG, "Sent to ElevenLabs: %s\n", message);
+	}
 	
 	ast_free(buf);
 	return 0;
@@ -999,13 +1072,13 @@ static void handle_websocket_message(struct elevenlabs_session *session, const c
 	
 	json = cJSON_Parse(message);
 	if (!json) {
-		ast_log(LOG_WARNING, "Failed to parse JSON message\n");
+		ast_log(LOG_WARNING, "Failed to parse JSON message: %s\n", message);
 		return;
 	}
 	
 	type_item = cJSON_GetObjectItem(json, "type");
 	if (!type_item || !cJSON_IsString(type_item)) {
-		ast_log(LOG_WARNING, "Message missing 'type' field\n");
+		ast_log(LOG_WARNING, "Message missing 'type' field: %s\n", message);
 		cJSON_Delete(json);
 		return;
 	}
@@ -1025,17 +1098,101 @@ static void handle_websocket_message(struct elevenlabs_session *session, const c
 				size_t audio_length;
 				unsigned char *audio_data = base64_decode(audio_base64_item->valuestring, &audio_length);
 				if (audio_data) {
-					/* Add to receive queue */
+					ast_log(LOG_NOTICE, "Received audio from ElevenLabs: event_id=%d, base64_size=%zu, raw_size=%zu\n", 
+						event_id_item->valueint, strlen(audio_base64_item->valuestring), audio_length);
+					
+					/* Add to receive queue for playback */
 					audio_queue_add(session->receive_queue, audio_data, audio_length, event_id_item->valueint);
-					ast_log(LOG_NOTICE, "Added audio to queue (event_id: %d, length: %zu)\n", 
-						event_id_item->valueint, audio_length);
 					ast_free(audio_data);
+				} else {
+					ast_log(LOG_ERROR, "Failed to decode base64 audio data\n");
 				}
 			}
 		}
 	}
 	
+	/* Check for other audio message formats from ElevenLabs */
+	cJSON *audio_chunk = cJSON_GetObjectItem(json, "audio_chunk");
+	if (audio_chunk && cJSON_IsString(audio_chunk)) {
+		/* Handle direct audio_chunk format */
+		size_t audio_length;
+		unsigned char *audio_data = base64_decode(audio_chunk->valuestring, &audio_length);
+		if (audio_data) {
+			ast_log(LOG_NOTICE, "Received audio_chunk from ElevenLabs: base64_size=%zu, raw_size=%zu\n", 
+				strlen(audio_chunk->valuestring), audio_length);
+			
+			/* Add to receive queue for playback */
+			audio_queue_add(session->receive_queue, audio_data, audio_length, session->current_event_id++);
+			ast_free(audio_data);
+		} else {
+			ast_log(LOG_ERROR, "Failed to decode base64 audio_chunk data\n");
+		}
+	}
+	
 	cJSON_Delete(json);
+}
+
+/*! \brief Add data to message buffer and process when complete */
+static int add_to_message_buffer(struct elevenlabs_session *session, const char *data, size_t len, int is_final)
+{
+	if (!session || !data || len == 0) {
+		return -1;
+	}
+	
+	/* Check if session is still active */
+	if (!session->session_active) {
+		ast_log(LOG_WARNING, "Ignoring message buffer add - session inactive\n");
+		return -1;
+	}
+	
+	ast_mutex_lock(&session->message_buffer_lock);
+	
+	/* Check if buffer has space */
+	if (session->message_buffer_size + len > session->message_buffer_capacity) {
+		ast_log(LOG_ERROR, "Message buffer overflow, resetting buffer\n");
+		session->message_buffer_size = 0;
+		ast_mutex_unlock(&session->message_buffer_lock);
+		return -1;
+	}
+	
+	/* Add data to buffer */
+	memcpy(session->message_buffer + session->message_buffer_size, data, len);
+	session->message_buffer_size += len;
+	
+	ast_log(LOG_NOTICE, "Added %zu bytes to message buffer (total: %zu, final: %s)\n", 
+		len, session->message_buffer_size, is_final ? "yes" : "no");
+	
+	/* If this is the final fragment, process the complete message */
+	if (is_final) {
+		process_complete_message(session);
+	}
+	
+	ast_mutex_unlock(&session->message_buffer_lock);
+	return 0;
+}
+
+/*! \brief Process complete reassembled message */
+static void process_complete_message(struct elevenlabs_session *session)
+{
+	char *complete_message;
+	
+	if (!session || session->message_buffer_size == 0) {
+		return;
+	}
+	
+	/* Null-terminate the message */
+	session->message_buffer[session->message_buffer_size] = '\0';
+	
+	/* Create a copy for processing */
+	complete_message = ast_strdupa(session->message_buffer);
+	
+	ast_log(LOG_NOTICE, "Processing complete message: %zu bytes\n", session->message_buffer_size);
+	
+	/* Reset buffer for next message */
+	session->message_buffer_size = 0;
+	
+	/* Process the complete message */
+	handle_websocket_message(session, complete_message);
 }
 
 /*! \brief Send conversation initiation message */
