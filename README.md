@@ -126,7 +126,8 @@ asterisk_elevenlabs/
    - Incoming audio is buffered and sent to agent as base64 chunks
    - Agent responses are queued and played with 20ms frame timing
 6. **Protocol Handling**: Ping/pong and interruption events processed
-7. **Session Cleanup**: All resources cleaned up on call termination
+7. **Session Management**: Application waits for conversation completion using condition variables
+8. **Session Cleanup**: All resources cleaned up on call termination
 
 ## CLI Commands
 
