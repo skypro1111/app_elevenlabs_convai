@@ -450,6 +450,7 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan, struc
 	} else {
 		ast_copy_string(session->caller_id, "Unknown", sizeof(session->caller_id));
 	}
+	ast_log(LOG_NOTICE, "Caller ID: %s\n", session->caller_id);
 	session->framehook_id = -1;
 	session->session_active = 1;
 	session->interruption_pending = 0;
@@ -782,7 +783,6 @@ static void *websocket_thread_func(void *arg)
 {
 	struct elevenlabs_session *session = arg;
 	struct lws_context_creation_info info;
-	struct lws_client_connect_info connect_info;
 	int n;
 	
 	ast_log(LOG_NOTICE, "WebSocket thread starting for channel %s\n", session->channel_name);
@@ -1683,29 +1683,26 @@ static void send_conversation_initiation(struct elevenlabs_session *session)
 		return;
 	}
 	
-	/* Create conversation initiation message */
+	/* Create contextual update message with caller ID */
 	json = cJSON_CreateObject();
-	cJSON_AddStringToObject(json, "type", "conversation_initiation_client_data");
+	cJSON_AddStringToObject(json, "type", "contextual_update");
 	
-	/* Add dynamic variables */
-	cJSON *dynamic_vars = cJSON_CreateObject();
-	
-	/* Add caller ID if configured to send it */
+	/* Add caller ID as text if configured to send it */
 	if (session->config->send_caller_number && !ast_strlen_zero(session->caller_id)) {
-		cJSON_AddStringToObject(dynamic_vars, "caller_id", session->caller_id);
+		char text_message[256];
+		snprintf(text_message, sizeof(text_message), "client_caller_id=%s", session->caller_id);
+		cJSON_AddStringToObject(json, "text", text_message);
 		if (session->config->debug) {
-			ast_log(LOG_DEBUG, "Adding caller_id to conversation initiation: %s\n", session->caller_id);
+			ast_log(LOG_DEBUG, "Adding caller_id to contextual update: %s\n", session->caller_id);
 		}
+	} else {
+		cJSON_AddStringToObject(json, "text", "client_caller_id=Unknown");
 	}
-	
-	cJSON_AddItemToObject(json, "dynamic_variables", dynamic_vars);
 	
 	message = cJSON_Print(json);
 	if (message) {
 		ast_log(LOG_NOTICE, "Sending conversation initiation message\n");
-		if (session->config->debug) {
-			ast_log(LOG_DEBUG, "Initiation message: %s\n", message);
-		}
+		ast_log(LOG_NOTICE, "=== CONVERSATION INITIATION MESSAGE ===\n%s\n=== END MESSAGE ===\n", message);
 		if (send_websocket_message(session, message) < 0) {
 			ast_log(LOG_WARNING, "Failed to send conversation initiation message\n");
 		}
@@ -2354,6 +2351,9 @@ static int unload_module(void)
 	}
 	agent_count = 0;
 	ast_mutex_unlock(&config_lock);
+	
+	/* Cleanup mutex */
+	ast_mutex_destroy(&config_lock);
 	
 	/* Cleanup CURL */
 	curl_global_cleanup();
