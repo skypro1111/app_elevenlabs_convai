@@ -1,0 +1,13 @@
+
+[general]
+debug=true
+
+[adelina_hr]
+elevenlabs_api_key=your_api_key
+elevenlabs_get_signed_url_endpoint=https://api.elevenlabs.io/v1/convai/conversation/get-signed-url
+elevenlabs_agent_id=agent_123SD
+elevenlabs_send_caller_number=true
+elevenlabs_audio_frames_buffer_ms=240
+debug=false
+max_connection_attempts=3
+connection_timeout_seconds=10

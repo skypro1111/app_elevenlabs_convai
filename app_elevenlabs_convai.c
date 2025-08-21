@@ -1,7 +1,7 @@
 /*
  * Asterisk -- An open source telephony toolkit.
  *
- * Copyright (C) 2025, skravchenko@stssrv.com
+ * Copyright (C) 2025, serhii.kravchenko@adelina.solutions
  *
  * See http://www.asterisk.org for more information about
  * the Asterisk project. Please do not directly contact
@@ -16,9 +16,9 @@
 
 /*! \file
  *
- * \brief ElevenLabs ConvAI dialplan application - Proper Architecture
+ * \brief ElevenLabs Conversational AI dialplan application
  *
- * \author skravchenko@stssrv.com
+ * \author serhii.kravchenko@adelina.solutions
  *
  * \ingroup applications
  */
@@ -88,6 +88,9 @@ struct agent_config {
 	char agent_id[64];
 	int send_caller_number;
 	int buffer_duration_ms;
+	int debug;
+	int max_connection_attempts;
+	int connection_timeout_seconds;
 };
 
 /*! \brief Audio queue item for buffering */
@@ -119,6 +122,7 @@ struct elevenlabs_session {
 	struct ast_channel *channel;
 	struct agent_config *config;
 	char channel_name[64];
+	char caller_id[128];
 	
 	/* WebSocket connection */
 	struct lws_context *ws_context;
@@ -147,6 +151,13 @@ struct elevenlabs_session {
 	int playback_running;
 	int session_active;
 	int interruption_pending; /* Flag to immediately stop current playback */
+	
+	/* Error handling and retry */
+	int connection_attempts;
+	int max_connection_attempts;
+	time_t last_connection_attempt;
+	int connection_timeout_seconds;
+	int last_error_code;
 	
 	/* Framehook */
 	int framehook_id;
@@ -209,6 +220,12 @@ static void send_conversation_initiation(struct elevenlabs_session *session);
 static int send_audio_to_websocket(struct elevenlabs_session *session, const unsigned char *audio_data, size_t length);
 static int add_to_message_buffer(struct elevenlabs_session *session, const char *data, size_t len, int is_final);
 static void process_complete_message(struct elevenlabs_session *session);
+
+/* Error handling and recovery */
+static int establish_websocket_connection(struct elevenlabs_session *session);
+static int should_retry_connection(struct elevenlabs_session *session);
+static void handle_connection_failure(struct elevenlabs_session *session, const char *error_msg);
+static const char *get_lws_error_string(int error_code);
 
 /* Base64 encoding */
 static char *base64_encode(const unsigned char *data, size_t input_length);
@@ -292,7 +309,7 @@ static char *get_signed_url(struct agent_config *config)
 				cJSON *signed_url_item = cJSON_GetObjectItem(json, "signed_url");
 				if (signed_url_item && cJSON_IsString(signed_url_item)) {
 					signed_url = ast_strdup(signed_url_item->valuestring);
-					if (elevenlabs_debug) {
+					if (config->debug) {
 						ast_log(LOG_DEBUG, "Got signed URL: %s\n", signed_url);
 					}
 				}
@@ -425,12 +442,28 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan, struc
 	session->channel = ast_channel_ref(chan); /* Take a reference to prevent channel destruction */
 	session->config = config;
 	ast_copy_string(session->channel_name, ast_channel_name(chan), sizeof(session->channel_name));
+	
+	/* Extract caller ID */
+	const char *caller_id = ast_channel_caller(chan)->id.number.str;
+	if (caller_id && !ast_strlen_zero(caller_id)) {
+		ast_copy_string(session->caller_id, caller_id, sizeof(session->caller_id));
+	} else {
+		ast_copy_string(session->caller_id, "Unknown", sizeof(session->caller_id));
+	}
 	session->framehook_id = -1;
 	session->session_active = 1;
 	session->interruption_pending = 0;
 	session->current_event_id = 1;
 	session->read_frame_count = 0;
 	session->write_frame_count = 0;
+	
+	/* Initialize error handling from config */
+	session->connection_attempts = 0;
+	session->max_connection_attempts = config->max_connection_attempts;
+	session->last_connection_attempt = 0;
+	session->connection_timeout_seconds = config->connection_timeout_seconds;
+	session->last_error_code = 0;
+	
 	ast_mutex_init(&session->session_lock);
 	
 	/* Initialize message buffer for WebSocket reassembly */
@@ -678,7 +711,7 @@ static struct ast_frame *framehook_callback(struct ast_channel *chan, struct ast
 			
 			if (should_process) {
 				/* Log frame details only in debug mode */
-				if (elevenlabs_debug) {
+				if (session->config->debug) {
 					const char *format_name = ast_format_get_name(frame->subclass.format);
 					session->read_frame_count++;
 					ast_log(LOG_DEBUG, "Framehook READ #%d: %s frame - %d bytes, %d samples\n", 
@@ -779,35 +812,48 @@ static void *websocket_thread_func(void *arg)
 		return NULL;
 	}
 	
-	/* Connect to WebSocket */
-	memset(&connect_info, 0, sizeof(connect_info));
-	connect_info.context = session->ws_context;
-	connect_info.address = session->ws_host;
-	connect_info.port = session->ws_port;
-	connect_info.path = session->ws_path;
-	connect_info.host = session->ws_host;
-	connect_info.origin = session->ws_host;
-	connect_info.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
-	connect_info.protocol = "convai";
-	connect_info.pwsi = &session->ws_connection;
-	
-	session->ws_connection = lws_client_connect_via_info(&connect_info);
-	if (!session->ws_connection) {
-		ast_log(LOG_ERROR, "Failed to initiate WebSocket connection\n");
+	/* Establish WebSocket connection with retry logic */
+	if (establish_websocket_connection(session) != 0) {
+		ast_log(LOG_ERROR, "Failed to establish WebSocket connection after retries\n");
 		lws_context_destroy(session->ws_context);
 		session->ws_context = NULL;
 		return NULL;
 	}
-	
-	ast_log(LOG_NOTICE, "WebSocket connection initiated\n");
 	
 	/* Main WebSocket service loop */
 	ast_log(LOG_NOTICE, "=== WEBSOCKET SERVICE LOOP START ===\n");
 	while (session->websocket_running && session->session_active) {
 		n = lws_service(session->ws_context, 100); /* 100ms timeout */
 		if (n < 0) {
-			ast_log(LOG_ERROR, "WebSocket service error: %d - EXITING LOOP\n", n);
+			session->last_error_code = n;
+			ast_log(LOG_ERROR, "WebSocket service error: %d (%s) - EXITING LOOP\n", 
+				n, get_lws_error_string(n));
+			
+			/* Try to reconnect if it's a recoverable error */
+			if (should_retry_connection(session)) {
+				ast_log(LOG_NOTICE, "Attempting to reconnect WebSocket...\n");
+				if (establish_websocket_connection(session) == 0) {
+					ast_log(LOG_NOTICE, "WebSocket reconnection successful\n");
+					continue; /* Resume service loop */
+				} else {
+					ast_log(LOG_ERROR, "WebSocket reconnection failed\n");
+				}
+			}
 			break;
+		}
+		
+		/* Check connection health periodically */
+		static time_t last_health_check = 0;
+		time_t now = time(NULL);
+		if (now - last_health_check >= 30) { /* Check every 30 seconds */
+			last_health_check = now;
+			if (!session->ws_connected && session->ws_connection) {
+				ast_log(LOG_WARNING, "WebSocket connection appears stale - attempting reconnection\n");
+				if (establish_websocket_connection(session) != 0) {
+					ast_log(LOG_ERROR, "Health check reconnection failed\n");
+					break;
+				}
+			}
 		}
 	}
 	
@@ -836,7 +882,9 @@ static int send_audio_to_websocket(struct elevenlabs_session *session, const uns
 	ast_mutex_unlock(&session->session_lock);
 	
 	if (!connection_ok) {
-		ast_log(LOG_DEBUG, "WebSocket not connected, skipping audio send\n");
+		if (session->config->debug) {
+			ast_log(LOG_DEBUG, "WebSocket not connected, skipping audio send\n");
+		}
 		return -1;
 	}
 	
@@ -856,9 +904,13 @@ static int send_audio_to_websocket(struct elevenlabs_session *session, const uns
 		ast_log(LOG_NOTICE, "Sending audio chunk to ElevenLabs: %zu bytes raw audio, %zu bytes base64\n", 
 			length, strlen(base64_audio));
 		
-		/* send_websocket_message now has its own connection validation */
-		if (send_websocket_message(session, message) < 0) {
-			ast_log(LOG_DEBUG, "Failed to send audio message - WebSocket may be disconnected\n");
+		/* send_websocket_message now has its own connection validation and recovery */
+		int send_result = send_websocket_message(session, message);
+		if (send_result < 0) {
+			if (session->config->debug) {
+				ast_log(LOG_DEBUG, "Failed to send audio message - WebSocket may be disconnected\n");
+			}
+			/* Audio send failures are handled gracefully - don't terminate session */
 		}
 		ast_free(message);
 	}
@@ -1167,19 +1219,33 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
 		ast_log(LOG_ERROR, "SWITCH: Matched LWS_CALLBACK_CLIENT_CONNECTION_ERROR\n");
 		if (session) {
-			ast_log(LOG_NOTICE, "Marking session as disconnected due to connection error\n");
-			ast_mutex_lock(&session->session_lock);
-			session->ws_connected = 0;
-			session->websocket_running = 0;
-			session->session_active = 0;
-			/* Clear connection pointer to prevent further use */
-			session->ws_connection = NULL;
-			ast_mutex_unlock(&session->session_lock);
+			ast_log(LOG_NOTICE, "Processing connection error for session %p\n", session);
 			
-			/* Signal playback thread to stop */
-			if (session->receive_queue) {
-				ast_log(LOG_NOTICE, "Signaling playback thread due to connection error\n");
-				ast_cond_signal(&session->receive_queue->cond);
+			/* Handle connection failure with retry logic */
+			handle_connection_failure(session, "WebSocket client connection error callback");
+			
+			/* Only terminate session if we've exhausted retries */
+			if (session->connection_attempts >= session->max_connection_attempts) {
+				ast_log(LOG_ERROR, "Max connection attempts exceeded - terminating session\n");
+				ast_mutex_lock(&session->session_lock);
+				session->websocket_running = 0;
+				session->session_active = 0;
+				ast_mutex_unlock(&session->session_lock);
+				
+				/* Signal playback thread to stop */
+				if (session->receive_queue) {
+					ast_log(LOG_NOTICE, "Signaling playback thread due to connection error\n");
+					ast_cond_signal(&session->receive_queue->cond);
+				}
+				
+				/* Hang up the call since we can't establish connection */
+				if (session->channel && !ast_check_hangup(session->channel)) {
+					ast_log(LOG_NOTICE, "Hanging up call due to persistent connection failures\n");
+					ast_softhangup(session->channel, AST_SOFTHANGUP_EXPLICIT);
+				}
+			} else {
+				ast_log(LOG_NOTICE, "Will retry connection (%d/%d attempts used)\n", 
+					session->connection_attempts, session->max_connection_attempts);
 			}
 		}
 		ast_log(LOG_ERROR, "=== CONNECTION ERROR HANDLING COMPLETE ===\n");
@@ -1277,6 +1343,7 @@ static int send_websocket_message(struct elevenlabs_session *session, const char
 	/* Double-check connection state under lock */
 	if (!session->session_active || !session->ws_connected || !session->ws_connection) {
 		ast_mutex_unlock(&session->session_lock);
+		/* Note: session access is safe here since we're in send_websocket_message */
 		ast_log(LOG_DEBUG, "WebSocket not connected, skipping message send\n");
 		return -1;
 	}
@@ -1297,7 +1364,7 @@ static int send_websocket_message(struct elevenlabs_session *session, const char
 	if (ws_conn && lws_write(ws_conn, buf + LWS_PRE, len, LWS_WRITE_TEXT) >= 0) {
 		result = 0;
 		/* Log sent messages only in debug mode */
-		if (elevenlabs_debug) {
+		if (session && session->config && session->config->debug) {
 			ast_log(LOG_DEBUG, "Sent to ElevenLabs: %s\n", message);
 		}
 	} else {
@@ -1323,7 +1390,7 @@ static void handle_websocket_message(struct elevenlabs_session *session, const c
 		return;
 	}
 	
-	if (elevenlabs_debug) {
+	if (session->config->debug) {
 		ast_log(LOG_DEBUG, "Received WebSocket message: %s\n", message);
 	}
 	
@@ -1610,7 +1677,9 @@ static void send_conversation_initiation(struct elevenlabs_session *session)
 	ast_mutex_unlock(&session->session_lock);
 	
 	if (!connection_ok) {
-		ast_log(LOG_DEBUG, "WebSocket not connected, skipping conversation initiation\n");
+		if (session->config->debug) {
+			ast_log(LOG_DEBUG, "WebSocket not connected, skipping conversation initiation\n");
+		}
 		return;
 	}
 	
@@ -1618,13 +1687,25 @@ static void send_conversation_initiation(struct elevenlabs_session *session)
 	json = cJSON_CreateObject();
 	cJSON_AddStringToObject(json, "type", "conversation_initiation_client_data");
 	
-	/* Add empty dynamic variables */
+	/* Add dynamic variables */
 	cJSON *dynamic_vars = cJSON_CreateObject();
+	
+	/* Add caller ID if configured to send it */
+	if (session->config->send_caller_number && !ast_strlen_zero(session->caller_id)) {
+		cJSON_AddStringToObject(dynamic_vars, "caller_id", session->caller_id);
+		if (session->config->debug) {
+			ast_log(LOG_DEBUG, "Adding caller_id to conversation initiation: %s\n", session->caller_id);
+		}
+	}
+	
 	cJSON_AddItemToObject(json, "dynamic_variables", dynamic_vars);
 	
 	message = cJSON_Print(json);
 	if (message) {
 		ast_log(LOG_NOTICE, "Sending conversation initiation message\n");
+		if (session->config->debug) {
+			ast_log(LOG_DEBUG, "Initiation message: %s\n", message);
+		}
 		if (send_websocket_message(session, message) < 0) {
 			ast_log(LOG_WARNING, "Failed to send conversation initiation message\n");
 		}
@@ -1797,6 +1878,158 @@ static unsigned char *base64_decode(const char *data, size_t *output_length)
 	return decoded_data;
 }
 
+/*! \brief Get human-readable error string for libwebsockets error codes */
+static const char *get_lws_error_string(int error_code)
+{
+	switch (error_code) {
+	case -1:
+		return "Generic error";
+	case -2:
+		return "Connection refused";
+	case -3:
+		return "Connection timeout";
+	case -4:
+		return "SSL/TLS handshake failed";
+	default:
+		return "Unknown error";
+	}
+}
+
+/*! \brief Check if connection should be retried based on error and attempt count */
+static int should_retry_connection(struct elevenlabs_session *session)
+{
+	if (!session) {
+		return 0;
+	}
+	
+	/* Don't retry if session is being shut down */
+	if (!session->session_active || !session->websocket_running) {
+		return 0;
+	}
+	
+	/* Don't retry if we've exceeded max attempts */
+	if (session->connection_attempts >= session->max_connection_attempts) {
+		ast_log(LOG_ERROR, "Maximum connection attempts (%d) exceeded\n", 
+			session->max_connection_attempts);
+		return 0;
+	}
+	
+	/* Don't retry too frequently */
+	time_t now = time(NULL);
+	if (now - session->last_connection_attempt < 5) { /* Wait at least 5 seconds */
+		if (session->config->debug) {
+			ast_log(LOG_DEBUG, "Too soon to retry connection (last attempt %ld seconds ago)\n", 
+				now - session->last_connection_attempt);
+		}
+		return 0;
+	}
+	
+	return 1;
+}
+
+/*! \brief Handle connection failure with appropriate logging and state updates */
+static void handle_connection_failure(struct elevenlabs_session *session, const char *error_msg)
+{
+	if (!session || !error_msg) {
+		return;
+	}
+	
+	ast_log(LOG_ERROR, "WebSocket connection failure: %s (attempt %d/%d)\n", 
+		error_msg, session->connection_attempts + 1, session->max_connection_attempts);
+	
+	/* Update session state */
+	ast_mutex_lock(&session->session_lock);
+	session->ws_connected = 0;
+	if (session->ws_connection) {
+		session->ws_connection = NULL;
+	}
+	session->connection_attempts++;
+	session->last_connection_attempt = time(NULL);
+	ast_mutex_unlock(&session->session_lock);
+	
+	/* Signal other threads about the failure */
+	if (session->receive_queue) {
+		ast_cond_signal(&session->receive_queue->cond);
+	}
+}
+
+/*! \brief Establish WebSocket connection with timeout and retry handling */
+static int establish_websocket_connection(struct elevenlabs_session *session)
+{
+	struct lws_client_connect_info connect_info;
+	time_t connection_start, now;
+	int n;
+	int connection_established = 0;
+	
+	if (!session || !session->ws_context) {
+		return -1;
+	}
+	
+	ast_log(LOG_NOTICE, "Establishing WebSocket connection (attempt %d/%d)\n", 
+		session->connection_attempts + 1, session->max_connection_attempts);
+	
+	/* Clean up any existing connection */
+	ast_mutex_lock(&session->session_lock);
+	if (session->ws_connection) {
+		lws_close_reason(session->ws_connection, LWS_CLOSE_STATUS_NORMAL, NULL, 0);
+		session->ws_connection = NULL;
+	}
+	session->ws_connected = 0;
+	ast_mutex_unlock(&session->session_lock);
+	
+	/* Set up connection info */
+	memset(&connect_info, 0, sizeof(connect_info));
+	connect_info.context = session->ws_context;
+	connect_info.address = session->ws_host;
+	connect_info.port = session->ws_port;
+	connect_info.path = session->ws_path;
+	connect_info.host = session->ws_host;
+	connect_info.origin = session->ws_host;
+	connect_info.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+	connect_info.protocol = "convai";
+	connect_info.pwsi = &session->ws_connection;
+	
+	/* Initiate connection */
+	session->ws_connection = lws_client_connect_via_info(&connect_info);
+	if (!session->ws_connection) {
+		handle_connection_failure(session, "Failed to initiate WebSocket connection");
+		return -1;
+	}
+	
+	ast_log(LOG_NOTICE, "WebSocket connection initiated, waiting for establishment...\n");
+	
+	/* Wait for connection with timeout */
+	connection_start = time(NULL);
+	while (!connection_established && session->websocket_running && session->session_active) {
+		n = lws_service(session->ws_context, 100); /* 100ms timeout per iteration */
+		if (n < 0) {
+			handle_connection_failure(session, get_lws_error_string(n));
+			return -1;
+		}
+		
+		/* Check if connection is established */
+		ast_mutex_lock(&session->session_lock);
+		connection_established = session->ws_connected;
+		ast_mutex_unlock(&session->session_lock);
+		
+		/* Check for timeout */
+		now = time(NULL);
+		if (now - connection_start > session->connection_timeout_seconds) {
+			handle_connection_failure(session, "Connection establishment timeout");
+			return -1;
+		}
+	}
+	
+	if (connection_established) {
+		ast_log(LOG_NOTICE, "WebSocket connection established successfully\n");
+		session->connection_attempts = 0; /* Reset counter on success */
+		return 0;
+	} else {
+		handle_connection_failure(session, "Connection establishment failed - session terminated");
+		return -1;
+	}
+}
+
 /*! \brief Add audio data to send buffer */
 static int add_audio_to_send_buffer(struct elevenlabs_session *session, const unsigned char *data, size_t length)
 {
@@ -1869,7 +2102,9 @@ static int send_buffered_audio(struct elevenlabs_session *session)
 	ast_mutex_unlock(&session->session_lock);
 	
 	if (!connection_ok) {
-		ast_log(LOG_DEBUG, "WebSocket not connected, skipping buffered audio send\n");
+		if (session->config->debug) {
+			ast_log(LOG_DEBUG, "WebSocket not connected, skipping buffered audio send\n");
+		}
 		return -1;
 	}
 	
@@ -1978,6 +2213,9 @@ static int load_config(void)
 		/* Set defaults */
 		agent_configs[i].send_caller_number = 0;
 		agent_configs[i].buffer_duration_ms = 240;
+		agent_configs[i].debug = elevenlabs_debug; /* Use global debug as default */
+		agent_configs[i].max_connection_attempts = 3;
+		agent_configs[i].connection_timeout_seconds = 10;
 		
 		var = ast_variable_browse(cfg, category);
 		while (var) {
@@ -1991,6 +2229,24 @@ static int load_config(void)
 				agent_configs[i].send_caller_number = ast_true(var->value);
 			} else if (strcmp(var->name, "elevenlabs_audio_frames_buffer_ms") == 0) {
 				agent_configs[i].buffer_duration_ms = atoi(var->value);
+			} else if (strcmp(var->name, "debug") == 0) {
+				agent_configs[i].debug = ast_true(var->value);
+			} else if (strcmp(var->name, "max_connection_attempts") == 0) {
+				int attempts = atoi(var->value);
+				if (attempts > 0 && attempts <= 10) {
+					agent_configs[i].max_connection_attempts = attempts;
+				} else {
+					ast_log(LOG_WARNING, "Invalid max_connection_attempts '%s' for agent '%s', using default\n", 
+						var->value, agent_configs[i].name);
+				}
+			} else if (strcmp(var->name, "connection_timeout_seconds") == 0) {
+				int timeout = atoi(var->value);
+				if (timeout > 0 && timeout <= 60) {
+					agent_configs[i].connection_timeout_seconds = timeout;
+				} else {
+					ast_log(LOG_WARNING, "Invalid connection_timeout_seconds '%s' for agent '%s', using default\n", 
+						var->value, agent_configs[i].name);
+				}
 			}
 			var = var->next;
 		}

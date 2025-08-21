@@ -1,4 +1,4 @@
-# Makefile for ElevenLabs ConvAI module
+# Makefile for ElevenLabs Conversational AI module
 CC = gcc
 CFLAGS = -fPIC -Wall -shared -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations -g3 -O2 -D_REENTRANT -D_GNU_SOURCE -DAST_MODULE=\"app_elevenlabs_convai\"
 ASTERISK_HEADERS = /usr/include/asterisk
