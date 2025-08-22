@@ -468,7 +468,7 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan, struc
 	ast_mutex_init(&session->session_lock);
 	
 	/* Initialize message buffer for WebSocket reassembly */
-	session->message_buffer_capacity = 64 * 1024; /* 64KB buffer for large audio messages */
+	session->message_buffer_capacity = 1024 * 1024; /* 1MB buffer for large audio messages */
 	session->message_buffer = ast_calloc(1, session->message_buffer_capacity);
 	if (!session->message_buffer) {
 		ast_log(LOG_ERROR, "Failed to allocate message buffer\n");
@@ -1612,12 +1612,25 @@ static int add_to_message_buffer(struct elevenlabs_session *session, const char 
 	
 	ast_mutex_lock(&session->message_buffer_lock);
 	
-	/* Check if buffer has space */
+	/* Check if buffer has space, expand if needed */
 	if (session->message_buffer_size + len > session->message_buffer_capacity) {
-		ast_log(LOG_ERROR, "Message buffer overflow, resetting buffer\n");
-		session->message_buffer_size = 0;
-		ast_mutex_unlock(&session->message_buffer_lock);
-		return -1;
+		size_t new_capacity = session->message_buffer_capacity * 2;
+		while (new_capacity < session->message_buffer_size + len) {
+			new_capacity *= 2;
+		}
+		
+		char *new_buffer = ast_realloc(session->message_buffer, new_capacity);
+		if (!new_buffer) {
+			ast_log(LOG_ERROR, "Failed to expand message buffer from %zu to %zu bytes\n", 
+				session->message_buffer_capacity, new_capacity);
+			session->message_buffer_size = 0;
+			ast_mutex_unlock(&session->message_buffer_lock);
+			return -1;
+		}
+		
+		session->message_buffer = new_buffer;
+		session->message_buffer_capacity = new_capacity;
+		ast_log(LOG_NOTICE, "Expanded message buffer to %zu bytes\n", new_capacity);
 	}
 	
 	/* Add data to buffer */
