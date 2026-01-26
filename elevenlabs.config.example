@@ -1,6 +1,9 @@
 
 [general]
-debug=true
+; Log level for the module: off, error, warning (default), notice, debug
+; Can be changed at runtime via CLI: "elevenlabs loglevel [level]"
+loglevel=warning
+
 
 [adelina_hr]
 elevenlabs_api_key=your_api_key
@@ -8,6 +11,17 @@ elevenlabs_get_signed_url_endpoint=https://api.elevenlabs.io/v1/convai/conversat
 elevenlabs_agent_id=agent_123SD
 elevenlabs_send_caller_number=true
 elevenlabs_audio_frames_buffer_ms=240
-debug=false
+
 max_connection_attempts=3
 connection_timeout_seconds=10
+
+; STT configuration (optional - parallel streaming to external STT service)
+; Audio is converted from 8kHz µ-law to 16kHz 16-bit PCM using Asterisk's
+; internal translator (ast_translator_build_path/ast_translate).
+; Requires codec_resample module to be loaded for 8kHz->16kHz conversion.
+enable_stt=false
+stt_websocket_url=ws://your-stt-service.com:8765
+; stt_websocket_url=wss://your-secure-stt-service.com/ws  ; for SSL connections
+; STT buffer duration in ms (0 = same as elevenlabs_audio_frames_buffer_ms)
+; Note: STT audio is sent as raw binary WebSocket messages (16-bit PCM, 16kHz, mono)
+stt_buffer_duration_ms=0
