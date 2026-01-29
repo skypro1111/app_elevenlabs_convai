@@ -42,6 +42,7 @@
 
 #include <cjson/cJSON.h>
 #include <curl/curl.h>
+#include <hiredis/hiredis.h>
 #include <libwebsockets.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -135,6 +136,13 @@ struct audio_queue {
   ast_cond_t cond;
 };
 
+/*! \brief Custom SIP header for transfer */
+struct custom_header {
+  char name[128];
+  char value[512];
+  struct custom_header *next;
+};
+
 /*! \brief HTTP response data */
 struct http_response {
   char *data;
@@ -148,6 +156,7 @@ struct elevenlabs_session {
   struct agent_config *config;
   char channel_name[64];
   char caller_id[128];
+  char called_id[128];
 
   /* WebSocket connection (ElevenLabs) */
   struct lws_context *ws_context;
@@ -252,12 +261,33 @@ struct elevenlabs_session {
   pthread_t stt_websocket_thread;
   int stt_websocket_running;
   int stt_connection_attempts;
+
+  /* Redis connection (optional) */
+  void *redis_context; /* redisContext*, as void* to avoid hiredis include
+                          dependency issues */
+
+  /* ElevenLabs conversation tracking for ingester events */
+  char conversation_id[128]; /* Conversation ID from ElevenLabs */
+  int started_event_sent;    /* Flag to track if 'started' event was sent */
+  int ended_event_sent;      /* Flag to track if 'ended' event was sent */
+
+  /* Custom X-* headers from incoming call for transfer */
+  struct custom_header *custom_headers;
 };
 
 /*! \brief Global agent configurations */
 static struct agent_config *agent_configs = NULL;
 static int agent_count = 0;
 static ast_mutex_t config_lock = AST_MUTEX_INIT_VALUE;
+
+/*! \brief Global Redis configuration */
+static char redis_host[256] = "127.0.0.1";
+static int redis_port = 6379;
+static int redis_db = 0;
+static char redis_password[256] = "";
+static int redis_enabled = 0;
+static char redis_ingester_queue[128] =
+    "ingester:events"; /* Queue for ingester events */
 
 /*! \brief Forward declarations */
 static int elevenlabs_exec(struct ast_channel *chan, const char *data);
@@ -274,6 +304,18 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan,
                                                  struct agent_config *config);
 static void destroy_session(struct elevenlabs_session *session);
 static void session_cleanup_cb(void *data);
+static void capture_custom_headers(struct elevenlabs_session *session,
+                                   struct ast_channel *chan);
+static void free_custom_headers(struct custom_header *headers);
+
+/* Redis connection management */
+static int connect_redis(struct elevenlabs_session *session);
+static void disconnect_redis(struct elevenlabs_session *session);
+
+/* Ingester event publishing */
+static int publish_ingester_event(struct elevenlabs_session *session,
+                                  const char *event_type,
+                                  const char *payload_json);
 
 /* Audio processing */
 static struct audio_queue *create_audio_queue(void);
@@ -480,6 +522,335 @@ static struct agent_config *find_agent_config(const char *name) {
   return NULL;
 }
 
+/*! \brief Connect to Redis server (optional, non-blocking) */
+static int connect_redis(struct elevenlabs_session *session) {
+  struct timeval timeout = {5, 0}; /* 5 seconds timeout */
+  redisContext *redis = NULL;
+  redisReply *reply = NULL;
+
+  if (!session) {
+    return -1;
+  }
+
+  /* Skip if Redis is disabled */
+  if (!redis_enabled) {
+    return 0;
+  }
+
+  /* Disconnect existing connection if any */
+  if (session->redis_context) {
+    redisFree((redisContext *)session->redis_context);
+    session->redis_context = NULL;
+  }
+
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Connecting to Redis at %s:%d (db=%d)\n", redis_host,
+                 redis_port, redis_db);
+
+  /* Connect to Redis with timeout */
+  redis = redisConnectWithTimeout(redis_host, redis_port, timeout);
+  if (!redis || redis->err) {
+    if (redis) {
+      ast_log(LOG_WARNING, "Redis connection error: %s\n", redis->errstr);
+      redisFree(redis);
+    } else {
+      ast_log(LOG_WARNING, "Redis connection error: cannot allocate context\n");
+    }
+    session->redis_context = NULL;
+    return -1;
+  }
+
+  /* Authenticate if password is set */
+  if (!ast_strlen_zero(redis_password)) {
+    reply = redisCommand(redis, "AUTH %s", redis_password);
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis authentication failed: %s\n",
+              reply ? reply->str : "no reply");
+      if (reply) {
+        freeReplyObject(reply);
+      }
+      redisFree(redis);
+      session->redis_context = NULL;
+      return -1;
+    }
+    freeReplyObject(reply);
+  }
+
+  /* Select database */
+  if (redis_db != 0) {
+    reply = redisCommand(redis, "SELECT %d", redis_db);
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis SELECT failed: %s\n",
+              reply ? reply->str : "no reply");
+      if (reply) {
+        freeReplyObject(reply);
+      }
+      redisFree(redis);
+      session->redis_context = NULL;
+      return -1;
+    }
+    freeReplyObject(reply);
+  }
+
+  session->redis_context = redis;
+
+  /* Test: Send a connection message with caller ID to verify connection works
+   */
+  char test_msg[256];
+  snprintf(test_msg, sizeof(test_msg),
+           "{\"event\":\"test\",\"caller_id\":\"unknown\"}");
+  reply = redisCommand(redis, "PUBLISH elevenlabs:test %s", test_msg);
+  if (reply) {
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Redis test message published, subscribers: %lld\n",
+                   reply->integer);
+    freeReplyObject(reply);
+  }
+
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Successfully connected to Redis\n");
+  return 0;
+}
+
+/*! \brief Disconnect from Redis server (safe) */
+static void disconnect_redis(struct elevenlabs_session *session) {
+  if (!session) {
+    return;
+  }
+
+  if (session->redis_context) {
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Disconnecting from Redis\n");
+    redisFree((redisContext *)session->redis_context);
+    session->redis_context = NULL;
+  }
+}
+
+/*! \brief Get current UTC timestamp in ISO-8601 format */
+static void get_utc_timestamp(char *buffer, size_t size) {
+  time_t now;
+  struct tm tm_utc;
+
+  time(&now);
+  gmtime_r(&now, &tm_utc);
+  strftime(buffer, size, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+}
+
+/*! \brief Publish ingester event to Redis queue
+ *
+ * Publishes events according to the Ingester Service specification:
+ * - event: "started", "transcript_chunk", "ended"
+ * - timestamp: UTC ISO-8601 format
+ * - elevenlabs_conversation_id: Session ID from ElevenLabs
+ * - elevenlabs_agent_id: Agent ID from configuration
+ * - asterisk_meta: Caller ID and Asterisk unique ID
+ * - payload: Event-specific data
+ */
+static int publish_ingester_event(struct elevenlabs_session *session,
+                                  const char *event_type,
+                                  const char *payload_json) {
+  redisContext *redis;
+  redisReply *reply;
+  cJSON *json;
+  cJSON *asterisk_meta;
+  cJSON *payload;
+  char *message;
+  char timestamp[64];
+  const char *uniqueid = NULL;
+
+  if (!session || !event_type) {
+    return -1;
+  }
+
+  /* Check if Redis is enabled and connected */
+  if (!redis_enabled || !session->redis_context) {
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Ingester: Skipping '%s' event - Redis %s\n", event_type,
+                   !redis_enabled ? "not enabled" : "not connected");
+    return 0;
+  }
+
+  redis = (redisContext *)session->redis_context;
+
+  /* Get current UTC timestamp */
+  get_utc_timestamp(timestamp, sizeof(timestamp));
+
+  /* Build JSON message according to Ingester Service spec */
+  json = cJSON_CreateObject();
+  if (!json) {
+    ast_log(LOG_ERROR, "Failed to create JSON object for ingester event\n");
+    return -1;
+  }
+
+  /* Required fields */
+  cJSON_AddStringToObject(json, "event", event_type);
+  cJSON_AddStringToObject(json, "timestamp", timestamp);
+
+  /* Use conversation_id if available, otherwise generate from Asterisk uniqueid
+   */
+  if (!ast_strlen_zero(session->conversation_id)) {
+    cJSON_AddStringToObject(json, "elevenlabs_conversation_id",
+                            session->conversation_id);
+  } else if (session->channel) {
+    uniqueid = ast_channel_uniqueid(session->channel);
+    if (!ast_strlen_zero(uniqueid)) {
+      cJSON_AddStringToObject(json, "elevenlabs_conversation_id", uniqueid);
+    } else {
+      cJSON_AddStringToObject(json, "elevenlabs_conversation_id", "unknown");
+    }
+  } else {
+    cJSON_AddStringToObject(json, "elevenlabs_conversation_id", "unknown");
+  }
+
+  /* Agent ID from configuration */
+  if (session->config && !ast_strlen_zero(session->config->agent_id)) {
+    cJSON_AddStringToObject(json, "elevenlabs_agent_id",
+                            session->config->agent_id);
+  } else {
+    cJSON_AddStringToObject(json, "elevenlabs_agent_id", "unknown");
+  }
+
+  /* Asterisk metadata (optional but recommended) */
+  asterisk_meta = cJSON_CreateObject();
+  if (asterisk_meta) {
+    if (!ast_strlen_zero(session->caller_id)) {
+      cJSON_AddStringToObject(asterisk_meta, "caller_id", session->caller_id);
+    }
+    if (session->channel) {
+      uniqueid = ast_channel_uniqueid(session->channel);
+      if (!ast_strlen_zero(uniqueid)) {
+        cJSON_AddStringToObject(asterisk_meta, "unique_id", uniqueid);
+      }
+    }
+    cJSON_AddItemToObject(json, "asterisk_meta", asterisk_meta);
+  }
+
+  /* Payload - parse from JSON string if provided, otherwise create empty object
+   */
+  if (payload_json && !ast_strlen_zero(payload_json)) {
+    payload = cJSON_Parse(payload_json);
+    if (payload) {
+      cJSON_AddItemToObject(json, "payload", payload);
+    } else {
+      ast_log(LOG_WARNING, "Failed to parse payload JSON: %s\n", payload_json);
+      cJSON_AddObjectToObject(json, "payload");
+    }
+  } else {
+    cJSON_AddObjectToObject(json, "payload");
+  }
+
+  /* Serialize JSON */
+  message = cJSON_PrintUnformatted(json);
+  cJSON_Delete(json);
+
+  if (!message) {
+    ast_log(LOG_ERROR, "Failed to serialize ingester event JSON\n");
+    return -1;
+  }
+
+  /* 1. Push to Redis list (queue) for reliable processing */
+  reply = redisCommand(redis, "RPUSH %s %s", redis_ingester_queue, message);
+
+  if (!reply) {
+    ast_log(LOG_ERROR, "Failed to RPUSH ingester event to Redis: %s\n",
+            redis->errstr);
+    ast_std_free(message);
+    return -1;
+  }
+
+  if (reply->type == REDIS_REPLY_ERROR) {
+    ast_log(LOG_ERROR, "Redis RPUSH error: %s\n", reply->str);
+    freeReplyObject(reply);
+    ast_std_free(message);
+    return -1;
+  }
+  freeReplyObject(reply);
+
+  /* 2. Also PUBLISH for real-time subscribers (monitoring) */
+  reply = redisCommand(redis, "PUBLISH %s %s", redis_ingester_queue, message);
+
+  if (reply) {
+    if (reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis PUBLISH error (non-fatal): %s\n", reply->str);
+    }
+    freeReplyObject(reply);
+  }
+
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Ingester: Published '%s' event to Redis queue '%s'\n",
+                 event_type, redis_ingester_queue);
+
+  ast_std_free(message); /* cJSON uses standard malloc */
+  return 0;
+}
+
+/*! \brief Publish 'started' event to ingester */
+static int publish_started_event(struct elevenlabs_session *session) {
+  if (!session) {
+    return -1;
+  }
+
+  /* Avoid sending duplicate started events */
+  if (session->started_event_sent) {
+    return 0;
+  }
+
+  session->started_event_sent = 1;
+  return publish_ingester_event(session, "started", "{\"type\":\"call\"}");
+}
+
+/*! \brief Publish 'transcript_chunk' event to ingester */
+static int publish_transcript_chunk(struct elevenlabs_session *session,
+                                    const char *text, const char *speaker,
+                                    int is_final) {
+  cJSON *payload;
+  char *payload_str;
+  int result;
+
+  if (!session || !text || !speaker) {
+    return -1;
+  }
+
+  /* Build payload JSON using cJSON for proper escaping */
+  payload = cJSON_CreateObject();
+  if (!payload) {
+    ast_log(LOG_ERROR, "Failed to create payload JSON for transcript_chunk\n");
+    return -1;
+  }
+
+  cJSON_AddStringToObject(payload, "text", text);
+  cJSON_AddStringToObject(payload, "speaker", speaker);
+  cJSON_AddBoolToObject(payload, "is_final", is_final ? 1 : 0);
+
+  payload_str = cJSON_PrintUnformatted(payload);
+  cJSON_Delete(payload);
+
+  if (!payload_str) {
+    ast_log(LOG_ERROR, "Failed to serialize transcript_chunk payload\n");
+    return -1;
+  }
+
+  result = publish_ingester_event(session, "transcript_chunk", payload_str);
+  ast_std_free(payload_str); /* cJSON uses standard malloc */
+
+  return result;
+}
+
+/*! \brief Publish 'ended' event to ingester */
+static int publish_ended_event(struct elevenlabs_session *session) {
+  if (!session) {
+    return -1;
+  }
+
+  /* Avoid sending duplicate ended events */
+  if (session->ended_event_sent) {
+    return 0;
+  }
+
+  session->ended_event_sent = 1;
+  return publish_ingester_event(session, "ended", "{}");
+}
+
 /*! \brief Main application function - BLOCKING until session ends */
 static int elevenlabs_exec(struct ast_channel *chan, const char *data) {
   char *agent_name;
@@ -598,6 +969,22 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan,
   }
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE, "Caller ID: %s\n",
                  session->caller_id);
+
+  /* Extract called ID (DNID - Dialed Number Identification) */
+  char dnid_buf[128] = "";
+  if (ast_func_read(chan, "CALLERID(dnid)", dnid_buf, sizeof(dnid_buf)) == 0 &&
+      !ast_strlen_zero(dnid_buf)) {
+    ast_copy_string(session->called_id, dnid_buf, sizeof(session->called_id));
+  } else {
+    ast_copy_string(session->called_id, "Unknown", sizeof(session->called_id));
+  }
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE, "Called ID (DNID): %s\n",
+                 session->called_id);
+
+  /* Capture X-* headers from incoming call for transfer */
+  session->custom_headers = NULL;
+  capture_custom_headers(session, chan);
+
   session->framehook_id = -1;
   session->session_active = 1;
   session->transfer_in_progress = 0;
@@ -622,6 +1009,11 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan,
   session->current_event_id = 1;
   session->read_frame_count = 0;
   session->write_frame_count = 0;
+  session->redis_context = NULL; /* Initialize Redis context */
+  session->conversation_id[0] =
+      '\0'; /* Will be set when we receive conversation_initiation_metadata */
+  session->started_event_sent = 0;
+  session->ended_event_sent = 0;
 
   /* Initialize error handling from config */
   session->connection_attempts = 0;
@@ -783,9 +1175,19 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan,
     session->stt_enabled = 0;
   }
 
-  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
-                 "ElevenLabs session created successfully (STT: %s)\n",
-                 session->stt_enabled ? "enabled" : "disabled");
+  /* Connect to Redis if enabled (non-blocking, errors ignored) */
+  if (redis_enabled) {
+    if (connect_redis(session) != 0) {
+      ast_log(LOG_WARNING,
+              "Failed to connect to Redis - continuing without it\n");
+    }
+  }
+
+  ELEVENLABS_LOG(
+      ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+      "ElevenLabs session created successfully (STT: %s, Redis: %s)\n",
+      session->stt_enabled ? "enabled" : "disabled",
+      session->redis_context ? "connected" : "disabled");
   return session;
 }
 
@@ -987,6 +1389,11 @@ static void destroy_session(struct elevenlabs_session *session) {
                  "Step 6b: Destroying STT translator\n");
   destroy_stt_translator(session);
 
+  /* Disconnect from Redis */
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Step 6c: Disconnecting from Redis\n");
+  disconnect_redis(session);
+
   /* Cleanup audio queue */
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
                  "Step 7: Cleaning up audio queue\n");
@@ -1022,6 +1429,14 @@ static void destroy_session(struct elevenlabs_session *session) {
     ast_mutex_destroy(&session->stt_send_buffer_lock);
   }
 
+  /* Free custom headers */
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Step 9b: Freeing custom headers\n");
+  if (session->custom_headers) {
+    free_custom_headers(session->custom_headers);
+    session->custom_headers = NULL;
+  }
+
   /* Cleanup message buffer */
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
                  "Step 10: Cleaning up message buffer\n");
@@ -1054,6 +1469,116 @@ static void destroy_session(struct elevenlabs_session *session) {
 
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
                  "=== DESTROY SESSION END ===\n");
+}
+
+/*! \brief Free custom headers linked list */
+static void free_custom_headers(struct custom_header *headers) {
+  struct custom_header *current = headers;
+  struct custom_header *next;
+
+  while (current) {
+    next = current->next;
+    ast_free(current);
+    current = next;
+  }
+}
+
+/*! \brief Capture X-* SIP headers from incoming channel for transfer */
+static void capture_custom_headers(struct elevenlabs_session *session,
+                                   struct ast_channel *chan) {
+  char header_list[2048] = "";
+  char header_value[512] = "";
+  char func_name[256];
+  struct custom_header *head = NULL;
+  struct custom_header *tail = NULL;
+  char *header_name;
+  char *saveptr;
+  int count = 0;
+
+  if (!session || !chan) {
+    return;
+  }
+
+  /* Get list of all X-* headers using PJSIP_HEADERS(X-) */
+  snprintf(func_name, sizeof(func_name), "PJSIP_HEADERS(X-)");
+  if (ast_func_read(chan, func_name, header_list, sizeof(header_list)) != 0) {
+    ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                   "No X-* headers found or PJSIP_HEADERS not available\n");
+    return;
+  }
+
+  if (ast_strlen_zero(header_list)) {
+    ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                   "No X-* headers in incoming call\n");
+    return;
+  }
+
+  ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG, "Found X-* headers: %s\n",
+                 header_list);
+
+  /* Parse comma-separated header names and read each value */
+  header_name = strtok_r(header_list, ",", &saveptr);
+  while (header_name) {
+    struct custom_header *hdr;
+
+    /* Skip leading/trailing whitespace */
+    while (*header_name == ' ') {
+      header_name++;
+    }
+    char *end = header_name + strlen(header_name) - 1;
+    while (end > header_name && *end == ' ') {
+      *end-- = '\0';
+    }
+
+    if (ast_strlen_zero(header_name)) {
+      header_name = strtok_r(NULL, ",", &saveptr);
+      continue;
+    }
+
+    /* Read header value */
+    snprintf(func_name, sizeof(func_name), "PJSIP_HEADER(read,%s)",
+             header_name);
+    header_value[0] = '\0';
+    if (ast_func_read(chan, func_name, header_value, sizeof(header_value)) !=
+            0 ||
+        ast_strlen_zero(header_value)) {
+      ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                     "Could not read value for header %s\n", header_name);
+      header_name = strtok_r(NULL, ",", &saveptr);
+      continue;
+    }
+
+    /* Allocate and populate header structure */
+    hdr = ast_calloc(1, sizeof(struct custom_header));
+    if (!hdr) {
+      ast_log(LOG_ERROR, "Failed to allocate memory for custom header\n");
+      header_name = strtok_r(NULL, ",", &saveptr);
+      continue;
+    }
+
+    ast_copy_string(hdr->name, header_name, sizeof(hdr->name));
+    ast_copy_string(hdr->value, header_value, sizeof(hdr->value));
+    hdr->next = NULL;
+
+    /* Add to linked list */
+    if (!head) {
+      head = hdr;
+      tail = hdr;
+    } else {
+      tail->next = hdr;
+      tail = hdr;
+    }
+    count++;
+
+    ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                   "Captured header: %s = %s\n", header_name, header_value);
+
+    header_name = strtok_r(NULL, ",", &saveptr);
+  }
+
+  session->custom_headers = head;
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Captured %d custom X-* headers for transfer\n", count);
 }
 
 /*! \brief Framehook callback - processes audio frames in real-time */
@@ -1781,6 +2306,23 @@ static void *dial_thread_func(void *arg) {
     return NULL;
   }
 
+  /* Set caller ID for outbound call to match original incoming call */
+  if (!ast_strlen_zero(session->caller_id)) {
+    ast_func_write(session->dial_channel, "CALLERID(num)", session->caller_id);
+    ast_func_write(session->dial_channel, "CALLERID(name)", session->caller_id);
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Set outbound CALLERID(num) and CALLERID(name) to: %s\n",
+                   session->caller_id);
+  }
+
+  /* Set called ID (DNID) for outbound call to match original incoming call */
+  if (!ast_strlen_zero(session->called_id) &&
+      strcmp(session->called_id, "Unknown") != 0) {
+    ast_func_write(session->dial_channel, "CALLERID(dnid)", session->called_id);
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Set outbound CALLERID(dnid) to: %s\n", session->called_id);
+  }
+
   /* Set SIP headers for outbound call */
   ast_channel_lock(session->dial_channel);
   uniqueid = ast_channel_uniqueid(session->dial_channel);
@@ -1801,6 +2343,27 @@ static void *dial_thread_func(void *arg) {
     pbx_builtin_setvar_helper(session->dial_channel,
                               "PJSIP_HEADER(add,X-Transfer-Reason)",
                               session->dial_reason);
+  }
+
+  /* Pass through all X-* headers from the original incoming call */
+  if (session->custom_headers) {
+    struct custom_header *hdr = session->custom_headers;
+    int header_count = 0;
+    char func_name[256];
+
+    while (hdr) {
+      snprintf(func_name, sizeof(func_name), "PJSIP_HEADER(add,%s)", hdr->name);
+      pbx_builtin_setvar_helper(session->dial_channel, func_name, hdr->value);
+      ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                     "Passing through header: %s = %s\n", hdr->name,
+                     hdr->value);
+      header_count++;
+      hdr = hdr->next;
+    }
+
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Passed through %d custom X-* headers from incoming call\n",
+                   header_count);
   }
 
   ELEVENLABS_LOG(
@@ -2109,6 +2672,9 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
           "WebSocket closed for channel: %s - %d audio chunks still buffered\n",
           session->channel_name, buffered_chunks);
 
+      /* Publish 'ended' event to ingester */
+      publish_ended_event(session);
+
       /* Stop websocket thread but let playback continue */
       ast_mutex_lock(&session->session_lock);
       session->websocket_running = 0;
@@ -2147,6 +2713,9 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
           ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
           "WebSocket closed for channel: %s - %d audio chunks still buffered\n",
           session->channel_name, buffered_chunks);
+
+      /* Publish 'ended' event to ingester (will be no-op if already sent) */
+      publish_ended_event(session);
 
       /* Stop websocket thread but let playback continue */
       ast_mutex_lock(&session->session_lock);
@@ -2310,6 +2879,150 @@ static void handle_websocket_message(struct elevenlabs_session *session,
     } else {
       ast_log(LOG_WARNING,
               "vad_score message missing vad_score_event object\n");
+    }
+  }
+  /* Handle conversation_initiation_metadata - capture conversation_id */
+  else if (strcmp(type_item->valuestring, "conversation_initiation_metadata") ==
+           0) {
+    cJSON *conversation_id_item = NULL;
+    cJSON *metadata_event = NULL;
+
+    /* Try to find conversation_id in nested structure first */
+    metadata_event =
+        cJSON_GetObjectItem(json, "conversation_initiation_metadata_event");
+    if (metadata_event && cJSON_IsObject(metadata_event)) {
+      conversation_id_item =
+          cJSON_GetObjectItem(metadata_event, "conversation_id");
+    }
+
+    /* Fallback to root level */
+    if (!conversation_id_item || !cJSON_IsString(conversation_id_item)) {
+      conversation_id_item = cJSON_GetObjectItem(json, "conversation_id");
+    }
+
+    if (conversation_id_item && cJSON_IsString(conversation_id_item)) {
+      ast_copy_string(session->conversation_id,
+                      conversation_id_item->valuestring,
+                      sizeof(session->conversation_id));
+      ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                     "Received conversation_id from ElevenLabs: %s\n",
+                     session->conversation_id);
+    } else {
+      /* Log the full message for debugging */
+      char *msg_str = cJSON_PrintUnformatted(json);
+      ast_log(LOG_WARNING,
+              "conversation_initiation_metadata missing conversation_id. "
+              "Message: %s\n",
+              msg_str ? msg_str : "(null)");
+      if (msg_str) {
+        ast_std_free(msg_str);
+      }
+    }
+
+    /* Publish 'started' event (will use Asterisk uniqueid as fallback) */
+    publish_started_event(session);
+  }
+  /* Handle user_transcript - user speech transcription */
+  else if (strcmp(type_item->valuestring, "user_transcript") == 0) {
+    cJSON *transcript_event =
+        cJSON_GetObjectItem(json, "user_transcription_event");
+    if (!transcript_event) {
+      /* Try alternate key */
+      transcript_event = cJSON_GetObjectItem(json, "user_transcript_event");
+    }
+
+    if (transcript_event && cJSON_IsObject(transcript_event)) {
+      cJSON *text_item =
+          cJSON_GetObjectItem(transcript_event, "user_transcript");
+      cJSON *is_final_item = cJSON_GetObjectItem(transcript_event, "is_final");
+
+      if (text_item && cJSON_IsString(text_item)) {
+        int is_final = (is_final_item && cJSON_IsBool(is_final_item))
+                           ? cJSON_IsTrue(is_final_item)
+                           : 1;
+
+        if (elevenlabs_loglevel >= ELEVENLABS_LOG_DEBUG) {
+          ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                         "User transcript (is_final=%d): %s\n", is_final,
+                         text_item->valuestring);
+        }
+
+        /* Publish transcript_chunk event for user (client) */
+        publish_transcript_chunk(session, text_item->valuestring, "client",
+                                 is_final);
+      }
+    } else {
+      /* Handle simple format where transcript is at root level */
+      cJSON *text_item = cJSON_GetObjectItem(json, "user_transcript");
+      if (text_item && cJSON_IsString(text_item)) {
+        cJSON *is_final_item = cJSON_GetObjectItem(json, "is_final");
+        int is_final = (is_final_item && cJSON_IsBool(is_final_item))
+                           ? cJSON_IsTrue(is_final_item)
+                           : 1;
+
+        if (elevenlabs_loglevel >= ELEVENLABS_LOG_DEBUG) {
+          ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                         "User transcript (simple format, is_final=%d): %s\n",
+                         is_final, text_item->valuestring);
+        }
+
+        publish_transcript_chunk(session, text_item->valuestring, "client",
+                                 is_final);
+      }
+    }
+  }
+  /* Handle agent_response - agent speech text */
+  else if (strcmp(type_item->valuestring, "agent_response") == 0) {
+    cJSON *response_event = cJSON_GetObjectItem(json, "agent_response_event");
+    if (!response_event) {
+      /* Try alternate key */
+      response_event = cJSON_GetObjectItem(json, "agent_response");
+    }
+
+    if (response_event && cJSON_IsObject(response_event)) {
+      cJSON *text_item = cJSON_GetObjectItem(response_event, "agent_response");
+      if (!text_item) {
+        text_item = cJSON_GetObjectItem(response_event, "text");
+      }
+      cJSON *is_final_item =
+          cJSON_GetObjectItem(response_event, "end_of_response");
+      if (!is_final_item) {
+        is_final_item = cJSON_GetObjectItem(response_event, "is_final");
+      }
+
+      if (text_item && cJSON_IsString(text_item)) {
+        int is_final = (is_final_item && cJSON_IsBool(is_final_item))
+                           ? cJSON_IsTrue(is_final_item)
+                           : 0;
+
+        if (elevenlabs_loglevel >= ELEVENLABS_LOG_DEBUG) {
+          ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                         "Agent response (is_final=%d): %s\n", is_final,
+                         text_item->valuestring);
+        }
+
+        /* Publish transcript_chunk event for agent */
+        publish_transcript_chunk(session, text_item->valuestring, "agent",
+                                 is_final);
+      }
+    } else {
+      /* Handle simple format */
+      cJSON *text_item = cJSON_GetObjectItem(json, "agent_response");
+      if (text_item && cJSON_IsString(text_item)) {
+        cJSON *is_final_item = cJSON_GetObjectItem(json, "end_of_response");
+        int is_final = (is_final_item && cJSON_IsBool(is_final_item))
+                           ? cJSON_IsTrue(is_final_item)
+                           : 0;
+
+        if (elevenlabs_loglevel >= ELEVENLABS_LOG_DEBUG) {
+          ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                         "Agent response (simple format, is_final=%d): %s\n",
+                         is_final, text_item->valuestring);
+        }
+
+        publish_transcript_chunk(session, text_item->valuestring, "agent",
+                                 is_final);
+      }
     }
   }
   /* Handle interruption messages with detailed logging */
@@ -2962,7 +3675,8 @@ static void send_conversation_initiation(struct elevenlabs_session *session) {
   json = cJSON_CreateObject();
   cJSON_AddStringToObject(json, "type", "conversation_initiation_client_data");
 
-  /* Add dynamic_variables with client_caller_id and callid */
+  /* Add dynamic_variables with client_caller_id, client_called_id, callid, and
+   * X-* headers */
   dynamic_variables = cJSON_CreateObject();
 
   if (session->config->send_caller_number &&
@@ -2978,6 +3692,19 @@ static void send_conversation_initiation(struct elevenlabs_session *session) {
     cJSON_AddStringToObject(dynamic_variables, "client_caller_id", "Unknown");
   }
 
+  /* Add client_called_id (DNID) */
+  if (!ast_strlen_zero(session->called_id)) {
+    cJSON_AddStringToObject(dynamic_variables, "client_called_id",
+                            session->called_id);
+    if (elevenlabs_loglevel >= ELEVENLABS_LOG_DEBUG) {
+      ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                     "Adding client_called_id to dynamic_variables: %s\n",
+                     session->called_id);
+    }
+  } else {
+    cJSON_AddStringToObject(dynamic_variables, "client_called_id", "Unknown");
+  }
+
   /* Add callid (Asterisk unique channel identifier) */
   if (session->channel) {
     const char *uniqueid = ast_channel_uniqueid(session->channel);
@@ -2987,6 +3714,20 @@ static void send_conversation_initiation(struct elevenlabs_session *session) {
         ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
                        "Adding callid to dynamic_variables: %s\n", uniqueid);
       }
+    }
+  }
+
+  /* Add X-* custom headers */
+  if (session->custom_headers) {
+    struct custom_header *hdr = session->custom_headers;
+    while (hdr) {
+      cJSON_AddStringToObject(dynamic_variables, hdr->name, hdr->value);
+      if (elevenlabs_loglevel >= ELEVENLABS_LOG_DEBUG) {
+        ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
+                       "Adding custom header to dynamic_variables: %s = %s\n",
+                       hdr->name, hdr->value);
+      }
+      hdr = hdr->next;
     }
   }
 
@@ -4192,6 +4933,31 @@ static int load_config(void) {
                 var->value);
         elevenlabs_loglevel = ELEVENLABS_LOG_WARNING;
       }
+    } else if (strcmp(var->name, "redis_host") == 0) {
+      ast_copy_string(redis_host, var->value, sizeof(redis_host));
+    } else if (strcmp(var->name, "redis_port") == 0) {
+      int port = atoi(var->value);
+      if (port > 0 && port <= 65535) {
+        redis_port = port;
+      } else {
+        ast_log(LOG_WARNING, "Invalid redis_port '%s', using default 6379\n",
+                var->value);
+      }
+    } else if (strcmp(var->name, "redis_db") == 0) {
+      int db = atoi(var->value);
+      if (db >= 0 && db <= 15) {
+        redis_db = db;
+      } else {
+        ast_log(LOG_WARNING, "Invalid redis_db '%s', using default 0\n",
+                var->value);
+      }
+    } else if (strcmp(var->name, "redis_password") == 0) {
+      ast_copy_string(redis_password, var->value, sizeof(redis_password));
+    } else if (strcmp(var->name, "redis_enabled") == 0) {
+      redis_enabled = ast_true(var->value);
+    } else if (strcmp(var->name, "redis_ingester_queue") == 0) {
+      ast_copy_string(redis_ingester_queue, var->value,
+                      sizeof(redis_ingester_queue));
     }
     var = var->next;
   }
@@ -4281,6 +5047,10 @@ static int load_config(void) {
   ast_mutex_unlock(&config_lock);
   ast_config_destroy(cfg);
 
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Redis: %s (host=%s, port=%d, db=%d, ingester_queue=%s)\n",
+                 redis_enabled ? "enabled" : "disabled", redis_host, redis_port,
+                 redis_db, redis_ingester_queue);
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
                  "Loaded %d agent configurations\n", agent_count);
   return 0;

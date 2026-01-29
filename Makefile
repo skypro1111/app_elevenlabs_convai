@@ -2,7 +2,7 @@
 CC = gcc
 CFLAGS = -fPIC -Wall -shared -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations -g3 -O2 -D_REENTRANT -D_GNU_SOURCE -DAST_MODULE=\"app_elevenlabs_convai\"
 ASTERISK_HEADERS = /usr/include/asterisk
-LIBS = -lasterisk -lcurl -lcjson -lwebsockets -lssl -lcrypto -lpthread
+LIBS = -lasterisk -lcurl -lcjson -lwebsockets -lssl -lcrypto -lpthread -lhiredis
 
 TARGET = app_elevenlabs_convai.so
 SOURCE = app_elevenlabs_convai.c
