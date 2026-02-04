@@ -266,10 +266,15 @@ struct elevenlabs_session {
   void *redis_context; /* redisContext*, as void* to avoid hiredis include
                           dependency issues */
 
-  /* ElevenLabs conversation tracking for ingester events */
+  /* ElevenLabs conversation tracking */
   char conversation_id[128]; /* Conversation ID from ElevenLabs */
   int started_event_sent;    /* Flag to track if 'started' event was sent */
   int ended_event_sent;      /* Flag to track if 'ended' event was sent */
+
+  /* Call lifecycle tracking for Redis events */
+  struct timeval call_start_time; /* When the call started (for duration_ms) */
+  time_t last_heartbeat_time;    /* Last heartbeat update timestamp */
+  char end_reason[32];           /* Reason for call end (normal, caller_hangup, etc.) */
 
   /* Custom X-* headers from incoming call for transfer */
   struct custom_header *custom_headers;
@@ -286,8 +291,6 @@ static int redis_port = 6379;
 static int redis_db = 0;
 static char redis_password[256] = "";
 static int redis_enabled = 0;
-static char redis_ingester_queue[128] =
-    "ingester:events"; /* Queue for ingester events */
 
 /*! \brief Forward declarations */
 static int elevenlabs_exec(struct ast_channel *chan, const char *data);
@@ -312,10 +315,25 @@ static void free_custom_headers(struct custom_header *headers);
 static int connect_redis(struct elevenlabs_session *session);
 static void disconnect_redis(struct elevenlabs_session *session);
 
-/* Ingester event publishing */
-static int publish_ingester_event(struct elevenlabs_session *session,
-                                  const char *event_type,
-                                  const char *payload_json);
+/* Redis event publishing (INGESTER_INSTRUCTION.md protocol) */
+static const char *get_redis_conversation_id(struct elevenlabs_session *session);
+static const char *get_agent_id(struct elevenlabs_session *session);
+static int redis_update_heartbeat(struct elevenlabs_session *session);
+static int redis_publish_call_started(struct elevenlabs_session *session);
+static int redis_publish_call_ended(struct elevenlabs_session *session,
+                                    const char *reason);
+static int redis_publish_transcript(struct elevenlabs_session *session,
+                                    const char *speaker, const char *text,
+                                    int is_final);
+static int redis_publish_agent_response(struct elevenlabs_session *session,
+                                        const char *text);
+static int redis_publish_agent_interrupted(struct elevenlabs_session *session,
+                                           const char *interrupted_text);
+static int redis_publish_error(struct elevenlabs_session *session,
+                               const char *code, const char *message);
+static int redis_forward_elevenlabs_message(struct elevenlabs_session *session,
+                                            const char *el_type,
+                                            const char *raw_json);
 
 /* Audio processing */
 static struct audio_queue *create_audio_queue(void);
@@ -594,16 +612,12 @@ static int connect_redis(struct elevenlabs_session *session) {
 
   session->redis_context = redis;
 
-  /* Test: Send a connection message with caller ID to verify connection works
-   */
-  char test_msg[256];
-  snprintf(test_msg, sizeof(test_msg),
-           "{\"event\":\"test\",\"caller_id\":\"unknown\"}");
-  reply = redisCommand(redis, "PUBLISH elevenlabs:test %s", test_msg);
+  /* Test: Ping Redis to verify connection works */
+  reply = redisCommand(redis, "PING");
   if (reply) {
     ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
-                   "Redis test message published, subscribers: %lld\n",
-                   reply->integer);
+                   "Redis PING response: %s\n",
+                   reply->str ? reply->str : "(null)");
     freeReplyObject(reply);
   }
 
@@ -626,229 +640,633 @@ static void disconnect_redis(struct elevenlabs_session *session) {
   }
 }
 
-/*! \brief Get current UTC timestamp in ISO-8601 format */
+/*! \brief Get current UTC timestamp in ISO-8601 format with milliseconds */
 static void get_utc_timestamp(char *buffer, size_t size) {
-  time_t now;
+  struct timeval tv;
   struct tm tm_utc;
+  char time_str[64];
 
-  time(&now);
-  gmtime_r(&now, &tm_utc);
-  strftime(buffer, size, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+  gettimeofday(&tv, NULL);
+  gmtime_r(&tv.tv_sec, &tm_utc);
+  strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm_utc);
+  snprintf(buffer, size, "%s.%03dZ", time_str, (int)(tv.tv_usec / 1000));
 }
 
-/*! \brief Publish ingester event to Redis queue
+/* ============================================================================
+ * Redis Event Publishing - INGESTER_INSTRUCTION.md protocol
  *
- * Publishes events according to the Ingester Service specification:
- * - event: "started", "transcript_chunk", "ended"
- * - timestamp: UTC ISO-8601 format
- * - elevenlabs_conversation_id: Session ID from ElevenLabs
- * - elevenlabs_agent_id: Agent ID from configuration
- * - asterisk_meta: Caller ID and Asterisk unique ID
- * - payload: Event-specific data
- */
-static int publish_ingester_event(struct elevenlabs_session *session,
-                                  const char *event_type,
-                                  const char *payload_json) {
+ * Redis key structure:
+ *   ast:calls                            - Hash: registry of active calls
+ *   ast:call:{conversation_id}:events    - Stream: ordered events per call
+ *   ast:call:{conversation_id}:pulse     - String with TTL: heartbeat
+ *   ast:events                           - Pub/Sub: real-time notifications
+ * ============================================================================ */
+
+/*! \brief Helper: get the conversation_id to use for Redis keys */
+static const char *get_redis_conversation_id(struct elevenlabs_session *session) {
+  if (!ast_strlen_zero(session->conversation_id)) {
+    return session->conversation_id;
+  }
+  if (session->channel) {
+    const char *uid = ast_channel_uniqueid(session->channel);
+    if (!ast_strlen_zero(uid)) {
+      return uid;
+    }
+  }
+  return "unknown";
+}
+
+/*! \brief Helper: get agent_id from session config */
+static const char *get_agent_id(struct elevenlabs_session *session) {
+  if (session->config && !ast_strlen_zero(session->config->agent_id)) {
+    return session->config->agent_id;
+  }
+  return "unknown";
+}
+
+/*! \brief Update heartbeat pulse key in Redis */
+static int redis_update_heartbeat(struct elevenlabs_session *session) {
   redisContext *redis;
   redisReply *reply;
-  cJSON *json;
-  cJSON *asterisk_meta;
-  cJSON *payload;
-  char *message;
-  char timestamp[64];
-  const char *uniqueid = NULL;
+  const char *conv_id;
+  char key[256];
 
-  if (!session || !event_type) {
+  if (!session || !redis_enabled || !session->redis_context) {
     return -1;
-  }
-
-  /* Check if Redis is enabled and connected */
-  if (!redis_enabled || !session->redis_context) {
-    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
-                   "Ingester: Skipping '%s' event - Redis %s\n", event_type,
-                   !redis_enabled ? "not enabled" : "not connected");
-    return 0;
   }
 
   redis = (redisContext *)session->redis_context;
+  conv_id = get_redis_conversation_id(session);
 
-  /* Get current UTC timestamp */
-  get_utc_timestamp(timestamp, sizeof(timestamp));
-
-  /* Build JSON message according to Ingester Service spec */
-  json = cJSON_CreateObject();
-  if (!json) {
-    ast_log(LOG_ERROR, "Failed to create JSON object for ingester event\n");
-    return -1;
-  }
-
-  /* Required fields */
-  cJSON_AddStringToObject(json, "event", event_type);
-  cJSON_AddStringToObject(json, "timestamp", timestamp);
-
-  /* Use conversation_id if available, otherwise generate from Asterisk uniqueid
-   */
-  if (!ast_strlen_zero(session->conversation_id)) {
-    cJSON_AddStringToObject(json, "elevenlabs_conversation_id",
-                            session->conversation_id);
-  } else if (session->channel) {
-    uniqueid = ast_channel_uniqueid(session->channel);
-    if (!ast_strlen_zero(uniqueid)) {
-      cJSON_AddStringToObject(json, "elevenlabs_conversation_id", uniqueid);
-    } else {
-      cJSON_AddStringToObject(json, "elevenlabs_conversation_id", "unknown");
-    }
-  } else {
-    cJSON_AddStringToObject(json, "elevenlabs_conversation_id", "unknown");
-  }
-
-  /* Agent ID from configuration */
-  if (session->config && !ast_strlen_zero(session->config->agent_id)) {
-    cJSON_AddStringToObject(json, "elevenlabs_agent_id",
-                            session->config->agent_id);
-  } else {
-    cJSON_AddStringToObject(json, "elevenlabs_agent_id", "unknown");
-  }
-
-  /* Asterisk metadata (optional but recommended) */
-  asterisk_meta = cJSON_CreateObject();
-  if (asterisk_meta) {
-    if (!ast_strlen_zero(session->caller_id)) {
-      cJSON_AddStringToObject(asterisk_meta, "caller_id", session->caller_id);
-    }
-    if (session->channel) {
-      uniqueid = ast_channel_uniqueid(session->channel);
-      if (!ast_strlen_zero(uniqueid)) {
-        cJSON_AddStringToObject(asterisk_meta, "unique_id", uniqueid);
-      }
-    }
-    cJSON_AddItemToObject(json, "asterisk_meta", asterisk_meta);
-  }
-
-  /* Payload - parse from JSON string if provided, otherwise create empty object
-   */
-  if (payload_json && !ast_strlen_zero(payload_json)) {
-    payload = cJSON_Parse(payload_json);
-    if (payload) {
-      cJSON_AddItemToObject(json, "payload", payload);
-    } else {
-      ast_log(LOG_WARNING, "Failed to parse payload JSON: %s\n", payload_json);
-      cJSON_AddObjectToObject(json, "payload");
-    }
-  } else {
-    cJSON_AddObjectToObject(json, "payload");
-  }
-
-  /* Serialize JSON */
-  message = cJSON_PrintUnformatted(json);
-  cJSON_Delete(json);
-
-  if (!message) {
-    ast_log(LOG_ERROR, "Failed to serialize ingester event JSON\n");
-    return -1;
-  }
-
-  /* 1. Push to Redis list (queue) for reliable processing */
-  reply = redisCommand(redis, "RPUSH %s %s", redis_ingester_queue, message);
-
+  snprintf(key, sizeof(key), "ast:call:%s:pulse", conv_id);
+  reply = redisCommand(redis, "SET %s 1 EX 60", key);
   if (!reply) {
-    ast_log(LOG_ERROR, "Failed to RPUSH ingester event to Redis: %s\n",
-            redis->errstr);
-    ast_std_free(message);
+    ast_log(LOG_WARNING, "Redis heartbeat SET failed: %s\n", redis->errstr);
     return -1;
   }
-
   if (reply->type == REDIS_REPLY_ERROR) {
-    ast_log(LOG_ERROR, "Redis RPUSH error: %s\n", reply->str);
+    ast_log(LOG_WARNING, "Redis heartbeat error: %s\n", reply->str);
     freeReplyObject(reply);
-    ast_std_free(message);
     return -1;
   }
   freeReplyObject(reply);
 
-  /* 2. Also PUBLISH for real-time subscribers (monitoring) */
-  reply = redisCommand(redis, "PUBLISH %s %s", redis_ingester_queue, message);
-
-  if (reply) {
-    if (reply->type == REDIS_REPLY_ERROR) {
-      ast_log(LOG_WARNING, "Redis PUBLISH error (non-fatal): %s\n", reply->str);
-    }
-    freeReplyObject(reply);
-  }
-
-  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
-                 "Ingester: Published '%s' event to Redis queue '%s'\n",
-                 event_type, redis_ingester_queue);
-
-  ast_std_free(message); /* cJSON uses standard malloc */
+  session->last_heartbeat_time = time(NULL);
   return 0;
 }
 
-/*! \brief Publish 'started' event to ingester */
-static int publish_started_event(struct elevenlabs_session *session) {
+/*! \brief Publish call.started event (Hash + Stream + Pulse + Pub/Sub) */
+static int redis_publish_call_started(struct elevenlabs_session *session) {
+  redisContext *redis;
+  redisReply *reply;
+  const char *conv_id;
+  const char *agent_id;
+  const char *uniqueid = NULL;
+  char timestamp[64];
+  char key[256];
+  cJSON *hash_json;
+  char *hash_str;
+
   if (!session) {
     return -1;
   }
 
-  /* Avoid sending duplicate started events */
+  /* Avoid duplicate */
   if (session->started_event_sent) {
     return 0;
   }
 
+  if (!redis_enabled || !session->redis_context) {
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Redis: Skipping call.started - Redis %s\n",
+                   !redis_enabled ? "not enabled" : "not connected");
+    session->started_event_sent = 1;
+    return 0;
+  }
+
+  redis = (redisContext *)session->redis_context;
+  conv_id = get_redis_conversation_id(session);
+  agent_id = get_agent_id(session);
+  get_utc_timestamp(timestamp, sizeof(timestamp));
+
+  if (session->channel) {
+    uniqueid = ast_channel_uniqueid(session->channel);
+  }
+
+  /* 1. HSET ast:calls {conversation_id} {json} */
+  hash_json = cJSON_CreateObject();
+  if (hash_json) {
+    cJSON_AddStringToObject(hash_json, "conversation_id", conv_id);
+    cJSON_AddStringToObject(hash_json, "agent_id", agent_id);
+    cJSON_AddStringToObject(hash_json, "asterisk_unique_id",
+                            uniqueid ? uniqueid : "");
+    cJSON_AddStringToObject(hash_json, "caller_id", session->caller_id);
+    cJSON_AddStringToObject(hash_json, "called_id", session->called_id);
+    cJSON_AddStringToObject(hash_json, "direction", "inbound");
+    cJSON_AddStringToObject(hash_json, "channel", session->channel_name);
+    cJSON_AddStringToObject(hash_json, "started_at", timestamp);
+
+    hash_str = cJSON_PrintUnformatted(hash_json);
+    cJSON_Delete(hash_json);
+
+    if (hash_str) {
+      reply = redisCommand(redis, "HSET ast:calls %s %s", conv_id, hash_str);
+      if (reply) {
+        if (reply->type == REDIS_REPLY_ERROR) {
+          ast_log(LOG_WARNING, "Redis HSET ast:calls error: %s\n", reply->str);
+        }
+        freeReplyObject(reply);
+      } else {
+        ast_log(LOG_WARNING, "Redis HSET ast:calls failed: %s\n",
+                redis->errstr);
+      }
+      ast_std_free(hash_str);
+    }
+  }
+
+  /* 2. XADD ast:call:{id}:events */
+  snprintf(key, sizeof(key), "ast:call:%s:events", conv_id);
+  reply = redisCommand(redis,
+    "XADD %s * type call.started conversation_id %s agent_id %s "
+    "asterisk_unique_id %s caller_id %s called_id %s direction inbound "
+    "channel %s started_at %s",
+    key, conv_id, agent_id,
+    uniqueid ? uniqueid : "", session->caller_id, session->called_id,
+    session->channel_name, timestamp);
+  if (reply) {
+    if (reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis XADD call.started error: %s\n", reply->str);
+    }
+    freeReplyObject(reply);
+  } else {
+    ast_log(LOG_WARNING, "Redis XADD call.started failed: %s\n",
+            redis->errstr);
+  }
+
+  /* 3. SET pulse */
+  redis_update_heartbeat(session);
+
+  /* 4. PUBLISH ast:events */
+  {
+    cJSON *pub_json = cJSON_CreateObject();
+    if (pub_json) {
+      char *pub_str;
+      cJSON_AddStringToObject(pub_json, "type", "call.started");
+      cJSON_AddStringToObject(pub_json, "conversation_id", conv_id);
+      cJSON_AddStringToObject(pub_json, "agent_id", agent_id);
+      cJSON_AddStringToObject(pub_json, "caller_id", session->caller_id);
+      cJSON_AddStringToObject(pub_json, "called_id", session->called_id);
+      cJSON_AddStringToObject(pub_json, "timestamp", timestamp);
+
+      pub_str = cJSON_PrintUnformatted(pub_json);
+      cJSON_Delete(pub_json);
+
+      if (pub_str) {
+        reply = redisCommand(redis, "PUBLISH ast:events %s", pub_str);
+        if (reply) {
+          freeReplyObject(reply);
+        }
+        ast_std_free(pub_str);
+      }
+    }
+  }
+
   session->started_event_sent = 1;
-  return publish_ingester_event(session, "started", "{\"type\":\"call\"}");
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Redis: Published call.started for %s\n", conv_id);
+  return 0;
 }
 
-/*! \brief Publish 'transcript_chunk' event to ingester */
-static int publish_transcript_chunk(struct elevenlabs_session *session,
-                                    const char *text, const char *speaker,
+/*! \brief Publish call.ended event (Stream + HDEL + DEL pulse + Pub/Sub) */
+static int redis_publish_call_ended(struct elevenlabs_session *session,
+                                    const char *reason) {
+  redisContext *redis;
+  redisReply *reply;
+  const char *conv_id;
+  const char *agent_id;
+  char timestamp[64];
+  char key[256];
+  long duration_ms = 0;
+  char duration_str[32];
+
+  if (!session) {
+    return -1;
+  }
+
+  /* Avoid duplicate */
+  if (session->ended_event_sent) {
+    return 0;
+  }
+
+  if (!reason || ast_strlen_zero(reason)) {
+    reason = session->end_reason;
+  }
+
+  if (!redis_enabled || !session->redis_context) {
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Redis: Skipping call.ended - Redis %s\n",
+                   !redis_enabled ? "not enabled" : "not connected");
+    session->ended_event_sent = 1;
+    return 0;
+  }
+
+  redis = (redisContext *)session->redis_context;
+  conv_id = get_redis_conversation_id(session);
+  agent_id = get_agent_id(session);
+  get_utc_timestamp(timestamp, sizeof(timestamp));
+
+  /* Calculate duration */
+  {
+    struct timeval now, diff;
+    gettimeofday(&now, NULL);
+    timersub(&now, &session->call_start_time, &diff);
+    duration_ms = (diff.tv_sec * 1000) + (diff.tv_usec / 1000);
+  }
+  snprintf(duration_str, sizeof(duration_str), "%ld", duration_ms);
+
+  /* 1. XADD ast:call:{id}:events */
+  snprintf(key, sizeof(key), "ast:call:%s:events", conv_id);
+  reply = redisCommand(redis,
+    "XADD %s * type call.ended reason %s duration_ms %s "
+    "caller_id %s called_id %s ended_at %s",
+    key, reason, duration_str,
+    session->caller_id, session->called_id, timestamp);
+  if (reply) {
+    if (reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis XADD call.ended error: %s\n", reply->str);
+    }
+    freeReplyObject(reply);
+  }
+
+  /* 2. HDEL ast:calls {conversation_id} */
+  reply = redisCommand(redis, "HDEL ast:calls %s", conv_id);
+  if (reply) {
+    freeReplyObject(reply);
+  }
+
+  /* 3. DEL ast:call:{id}:pulse */
+  snprintf(key, sizeof(key), "ast:call:%s:pulse", conv_id);
+  reply = redisCommand(redis, "DEL %s", key);
+  if (reply) {
+    freeReplyObject(reply);
+  }
+
+  /* 4. PUBLISH ast:events */
+  {
+    cJSON *pub_json = cJSON_CreateObject();
+    if (pub_json) {
+      char *pub_str;
+      cJSON_AddStringToObject(pub_json, "type", "call.ended");
+      cJSON_AddStringToObject(pub_json, "conversation_id", conv_id);
+      cJSON_AddStringToObject(pub_json, "agent_id", agent_id);
+      cJSON_AddStringToObject(pub_json, "caller_id", session->caller_id);
+      cJSON_AddStringToObject(pub_json, "called_id", session->called_id);
+      cJSON_AddStringToObject(pub_json, "reason", reason);
+      cJSON_AddNumberToObject(pub_json, "duration_ms", duration_ms);
+      cJSON_AddStringToObject(pub_json, "timestamp", timestamp);
+
+      pub_str = cJSON_PrintUnformatted(pub_json);
+      cJSON_Delete(pub_json);
+
+      if (pub_str) {
+        reply = redisCommand(redis, "PUBLISH ast:events %s", pub_str);
+        if (reply) {
+          freeReplyObject(reply);
+        }
+        ast_std_free(pub_str);
+      }
+    }
+  }
+
+  session->ended_event_sent = 1;
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Redis: Published call.ended for %s (reason=%s, duration=%ld ms)\n",
+                 conv_id, reason, duration_ms);
+  return 0;
+}
+
+/*! \brief Publish transcript event (Stream + Pub/Sub if is_final) */
+static int redis_publish_transcript(struct elevenlabs_session *session,
+                                    const char *speaker, const char *text,
                                     int is_final) {
-  cJSON *payload;
-  char *payload_str;
-  int result;
+  redisContext *redis;
+  redisReply *reply;
+  const char *conv_id;
+  char timestamp[64];
+  char key[256];
 
   if (!session || !text || !speaker) {
     return -1;
   }
 
-  /* Build payload JSON using cJSON for proper escaping */
-  payload = cJSON_CreateObject();
-  if (!payload) {
-    ast_log(LOG_ERROR, "Failed to create payload JSON for transcript_chunk\n");
-    return -1;
+  if (!redis_enabled || !session->redis_context) {
+    return 0;
   }
 
-  cJSON_AddStringToObject(payload, "text", text);
-  cJSON_AddStringToObject(payload, "speaker", speaker);
-  cJSON_AddBoolToObject(payload, "is_final", is_final ? 1 : 0);
+  redis = (redisContext *)session->redis_context;
+  conv_id = get_redis_conversation_id(session);
+  get_utc_timestamp(timestamp, sizeof(timestamp));
 
-  payload_str = cJSON_PrintUnformatted(payload);
-  cJSON_Delete(payload);
-
-  if (!payload_str) {
-    ast_log(LOG_ERROR, "Failed to serialize transcript_chunk payload\n");
-    return -1;
+  /* XADD to stream */
+  snprintf(key, sizeof(key), "ast:call:%s:events", conv_id);
+  reply = redisCommand(redis,
+    "XADD %s * type transcript speaker %s text %s is_final %d "
+    "caller_id %s called_id %s timestamp %s",
+    key, speaker, text, is_final,
+    session->caller_id, session->called_id, timestamp);
+  if (reply) {
+    if (reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis XADD transcript error: %s\n", reply->str);
+    }
+    freeReplyObject(reply);
   }
 
-  result = publish_ingester_event(session, "transcript_chunk", payload_str);
-  ast_std_free(payload_str); /* cJSON uses standard malloc */
+  /* PUBLISH only for is_final=1 */
+  if (is_final) {
+    cJSON *pub_json = cJSON_CreateObject();
+    if (pub_json) {
+      char *pub_str;
+      cJSON_AddStringToObject(pub_json, "type", "transcript");
+      cJSON_AddStringToObject(pub_json, "conversation_id", conv_id);
+      cJSON_AddStringToObject(pub_json, "speaker", speaker);
+      cJSON_AddBoolToObject(pub_json, "is_final", 1);
+      cJSON_AddStringToObject(pub_json, "caller_id", session->caller_id);
+      cJSON_AddStringToObject(pub_json, "called_id", session->called_id);
+      cJSON_AddStringToObject(pub_json, "timestamp", timestamp);
 
-  return result;
+      pub_str = cJSON_PrintUnformatted(pub_json);
+      cJSON_Delete(pub_json);
+
+      if (pub_str) {
+        reply = redisCommand(redis, "PUBLISH ast:events %s", pub_str);
+        if (reply) {
+          freeReplyObject(reply);
+        }
+        ast_std_free(pub_str);
+      }
+    }
+  }
+
+  return 0;
 }
 
-/*! \brief Publish 'ended' event to ingester */
-static int publish_ended_event(struct elevenlabs_session *session) {
+/*! \brief Publish agent.response event (Stream + Pub/Sub) */
+static int redis_publish_agent_response(struct elevenlabs_session *session,
+                                        const char *text) {
+  redisContext *redis;
+  redisReply *reply;
+  const char *conv_id;
+  char timestamp[64];
+  char key[256];
+
+  if (!session || !text) {
+    return -1;
+  }
+
+  if (!redis_enabled || !session->redis_context) {
+    return 0;
+  }
+
+  redis = (redisContext *)session->redis_context;
+  conv_id = get_redis_conversation_id(session);
+  get_utc_timestamp(timestamp, sizeof(timestamp));
+
+  /* XADD to stream */
+  snprintf(key, sizeof(key), "ast:call:%s:events", conv_id);
+  reply = redisCommand(redis,
+    "XADD %s * type agent.response text %s "
+    "caller_id %s called_id %s timestamp %s",
+    key, text,
+    session->caller_id, session->called_id, timestamp);
+  if (reply) {
+    if (reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis XADD agent.response error: %s\n", reply->str);
+    }
+    freeReplyObject(reply);
+  }
+
+  /* PUBLISH */
+  {
+    cJSON *pub_json = cJSON_CreateObject();
+    if (pub_json) {
+      char *pub_str;
+      cJSON_AddStringToObject(pub_json, "type", "agent.response");
+      cJSON_AddStringToObject(pub_json, "conversation_id", conv_id);
+      cJSON_AddStringToObject(pub_json, "caller_id", session->caller_id);
+      cJSON_AddStringToObject(pub_json, "called_id", session->called_id);
+      cJSON_AddStringToObject(pub_json, "timestamp", timestamp);
+
+      pub_str = cJSON_PrintUnformatted(pub_json);
+      cJSON_Delete(pub_json);
+
+      if (pub_str) {
+        reply = redisCommand(redis, "PUBLISH ast:events %s", pub_str);
+        if (reply) {
+          freeReplyObject(reply);
+        }
+        ast_std_free(pub_str);
+      }
+    }
+  }
+
+  return 0;
+}
+
+/*! \brief Publish agent.interrupted event (Stream + Pub/Sub) */
+static int redis_publish_agent_interrupted(struct elevenlabs_session *session,
+                                           const char *interrupted_text) {
+  redisContext *redis;
+  redisReply *reply;
+  const char *conv_id;
+  char timestamp[64];
+  char key[256];
+
   if (!session) {
     return -1;
   }
 
-  /* Avoid sending duplicate ended events */
-  if (session->ended_event_sent) {
+  if (!redis_enabled || !session->redis_context) {
     return 0;
   }
 
-  session->ended_event_sent = 1;
-  return publish_ingester_event(session, "ended", "{}");
+  redis = (redisContext *)session->redis_context;
+  conv_id = get_redis_conversation_id(session);
+  get_utc_timestamp(timestamp, sizeof(timestamp));
+
+  /* XADD to stream */
+  snprintf(key, sizeof(key), "ast:call:%s:events", conv_id);
+  reply = redisCommand(redis,
+    "XADD %s * type agent.interrupted interrupted_text %s "
+    "caller_id %s called_id %s timestamp %s",
+    key, interrupted_text ? interrupted_text : "",
+    session->caller_id, session->called_id, timestamp);
+  if (reply) {
+    if (reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis XADD agent.interrupted error: %s\n",
+              reply->str);
+    }
+    freeReplyObject(reply);
+  }
+
+  /* PUBLISH */
+  {
+    cJSON *pub_json = cJSON_CreateObject();
+    if (pub_json) {
+      char *pub_str;
+      cJSON_AddStringToObject(pub_json, "type", "agent.interrupted");
+      cJSON_AddStringToObject(pub_json, "conversation_id", conv_id);
+      cJSON_AddStringToObject(pub_json, "caller_id", session->caller_id);
+      cJSON_AddStringToObject(pub_json, "called_id", session->called_id);
+      cJSON_AddStringToObject(pub_json, "timestamp", timestamp);
+
+      pub_str = cJSON_PrintUnformatted(pub_json);
+      cJSON_Delete(pub_json);
+
+      if (pub_str) {
+        reply = redisCommand(redis, "PUBLISH ast:events %s", pub_str);
+        if (reply) {
+          freeReplyObject(reply);
+        }
+        ast_std_free(pub_str);
+      }
+    }
+  }
+
+  return 0;
+}
+
+/*! \brief Publish error event (Stream + Pub/Sub) */
+static int redis_publish_error(struct elevenlabs_session *session,
+                               const char *code, const char *message) {
+  redisContext *redis;
+  redisReply *reply;
+  const char *conv_id;
+  char timestamp[64];
+  char key[256];
+
+  if (!session) {
+    return -1;
+  }
+
+  if (!redis_enabled || !session->redis_context) {
+    return 0;
+  }
+
+  redis = (redisContext *)session->redis_context;
+  conv_id = get_redis_conversation_id(session);
+  get_utc_timestamp(timestamp, sizeof(timestamp));
+
+  /* XADD to stream */
+  snprintf(key, sizeof(key), "ast:call:%s:events", conv_id);
+  reply = redisCommand(redis,
+    "XADD %s * type error code %s message %s "
+    "caller_id %s called_id %s timestamp %s",
+    key, code ? code : "UNKNOWN", message ? message : "",
+    session->caller_id, session->called_id, timestamp);
+  if (reply) {
+    if (reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis XADD error event error: %s\n", reply->str);
+    }
+    freeReplyObject(reply);
+  }
+
+  /* PUBLISH */
+  {
+    cJSON *pub_json = cJSON_CreateObject();
+    if (pub_json) {
+      char *pub_str;
+      cJSON_AddStringToObject(pub_json, "type", "error");
+      cJSON_AddStringToObject(pub_json, "conversation_id", conv_id);
+      cJSON_AddStringToObject(pub_json, "code", code ? code : "UNKNOWN");
+      cJSON_AddStringToObject(pub_json, "caller_id", session->caller_id);
+      cJSON_AddStringToObject(pub_json, "called_id", session->called_id);
+      cJSON_AddStringToObject(pub_json, "timestamp", timestamp);
+
+      pub_str = cJSON_PrintUnformatted(pub_json);
+      cJSON_Delete(pub_json);
+
+      if (pub_str) {
+        reply = redisCommand(redis, "PUBLISH ast:events %s", pub_str);
+        if (reply) {
+          freeReplyObject(reply);
+        }
+        ast_std_free(pub_str);
+      }
+    }
+  }
+
+  return 0;
+}
+
+/*! \brief Forward ElevenLabs WebSocket message to Redis (except audio/vad_score) */
+static int redis_forward_elevenlabs_message(struct elevenlabs_session *session,
+                                            const char *el_type,
+                                            const char *raw_json) {
+  redisContext *redis;
+  redisReply *reply;
+  const char *conv_id;
+  char timestamp[64];
+  char key[256];
+  char event_type[128];
+
+  if (!session || !el_type || !raw_json) {
+    return -1;
+  }
+
+  /* Skip audio and vad_score - too frequent */
+  if (strcmp(el_type, "audio") == 0 || strcmp(el_type, "vad_score") == 0) {
+    return 0;
+  }
+
+  if (!redis_enabled || !session->redis_context) {
+    return 0;
+  }
+
+  redis = (redisContext *)session->redis_context;
+  conv_id = get_redis_conversation_id(session);
+  get_utc_timestamp(timestamp, sizeof(timestamp));
+
+  snprintf(event_type, sizeof(event_type), "elevenlabs.%s", el_type);
+
+  /* XADD to stream */
+  snprintf(key, sizeof(key), "ast:call:%s:events", conv_id);
+  reply = redisCommand(redis,
+    "XADD %s * type %s payload %s "
+    "caller_id %s called_id %s timestamp %s",
+    key, event_type, raw_json,
+    session->caller_id, session->called_id, timestamp);
+  if (reply) {
+    if (reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis XADD %s error: %s\n", event_type, reply->str);
+    }
+    freeReplyObject(reply);
+  }
+
+  /* PUBLISH to Pub/Sub */
+  {
+    cJSON *pub_json = cJSON_CreateObject();
+    if (pub_json) {
+      char *pub_str;
+      cJSON_AddStringToObject(pub_json, "type", event_type);
+      cJSON_AddStringToObject(pub_json, "conversation_id", conv_id);
+      cJSON_AddStringToObject(pub_json, "caller_id", session->caller_id);
+      cJSON_AddStringToObject(pub_json, "called_id", session->called_id);
+      cJSON_AddStringToObject(pub_json, "timestamp", timestamp);
+
+      pub_str = cJSON_PrintUnformatted(pub_json);
+      cJSON_Delete(pub_json);
+
+      if (pub_str) {
+        reply = redisCommand(redis, "PUBLISH ast:events %s", pub_str);
+        if (reply) {
+          freeReplyObject(reply);
+        }
+        ast_std_free(pub_str);
+      }
+    }
+  }
+
+  return 0;
 }
 
 /*! \brief Main application function - BLOCKING until session ends */
@@ -1014,6 +1432,9 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan,
       '\0'; /* Will be set when we receive conversation_initiation_metadata */
   session->started_event_sent = 0;
   session->ended_event_sent = 0;
+  gettimeofday(&session->call_start_time, NULL); /* Track call start for duration */
+  session->last_heartbeat_time = 0;
+  ast_copy_string(session->end_reason, "normal", sizeof(session->end_reason));
 
   /* Initialize error handling from config */
   session->connection_attempts = 0;
@@ -1388,6 +1809,9 @@ static void destroy_session(struct elevenlabs_session *session) {
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
                  "Step 6b: Destroying STT translator\n");
   destroy_stt_translator(session);
+
+  /* Publish call.ended as safety net (no-op if already sent) */
+  redis_publish_call_ended(session, session->end_reason);
 
   /* Disconnect from Redis */
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
@@ -1802,6 +2226,14 @@ static void *websocket_thread_func(void *arg) {
         }
       }
       break;
+    }
+
+    /* Update Redis heartbeat every 15 seconds */
+    {
+      time_t heartbeat_now = time(NULL);
+      if (heartbeat_now - session->last_heartbeat_time >= 15) {
+        redis_update_heartbeat(session);
+      }
     }
 
     /* Check connection health periodically */
@@ -2258,6 +2690,11 @@ static void *hangup_monitor_thread_func(void *arg) {
           "cleanup\n",
           session->channel_name);
 
+      /* Set end reason and publish call.ended before cleanup */
+      ast_copy_string(session->end_reason, "caller_hangup",
+                      sizeof(session->end_reason));
+      redis_publish_call_ended(session, "caller_hangup");
+
       ast_mutex_lock(&session->session_lock);
       session->session_active = 0;
       session->ws_connected = 0;
@@ -2616,6 +3053,10 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
                        "Processing connection error for session %p\n", session);
       }
 
+      /* Publish error event to Redis */
+      redis_publish_error(session, "WS_CONNECTION_ERROR",
+                          "WebSocket client connection error");
+
       /* Handle connection failure with retry logic */
       handle_connection_failure(session,
                                 "WebSocket client connection error callback");
@@ -2624,6 +3065,9 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
       if (session->connection_attempts >= session->max_connection_attempts) {
         ast_log(LOG_ERROR,
                 "Max connection attempts exceeded - terminating session\n");
+        ast_copy_string(session->end_reason, "error",
+                        sizeof(session->end_reason));
+        redis_publish_call_ended(session, "error");
         ast_mutex_lock(&session->session_lock);
         session->websocket_running = 0;
         session->session_active = 0;
@@ -2672,8 +3116,8 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
           "WebSocket closed for channel: %s - %d audio chunks still buffered\n",
           session->channel_name, buffered_chunks);
 
-      /* Publish 'ended' event to ingester */
-      publish_ended_event(session);
+      /* Publish call.ended event to Redis */
+      redis_publish_call_ended(session, session->end_reason);
 
       /* Stop websocket thread but let playback continue */
       ast_mutex_lock(&session->session_lock);
@@ -2714,8 +3158,8 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
           "WebSocket closed for channel: %s - %d audio chunks still buffered\n",
           session->channel_name, buffered_chunks);
 
-      /* Publish 'ended' event to ingester (will be no-op if already sent) */
-      publish_ended_event(session);
+      /* Publish call.ended event to Redis (will be no-op if already sent) */
+      redis_publish_call_ended(session, session->end_reason);
 
       /* Stop websocket thread but let playback continue */
       ast_mutex_lock(&session->session_lock);
@@ -2841,6 +3285,9 @@ static void handle_websocket_message(struct elevenlabs_session *session,
                    type_item->valuestring);
   }
 
+  /* Forward ALL ElevenLabs messages to Redis (except audio/vad_score) */
+  redis_forward_elevenlabs_message(session, type_item->valuestring, message);
+
   /* Handle vad_score messages with detailed logging */
   if (strcmp(type_item->valuestring, "vad_score") == 0) {
     cJSON *vad_score_event = cJSON_GetObjectItem(json, "vad_score_event");
@@ -2919,8 +3366,8 @@ static void handle_websocket_message(struct elevenlabs_session *session,
       }
     }
 
-    /* Publish 'started' event (will use Asterisk uniqueid as fallback) */
-    publish_started_event(session);
+    /* Publish call.started event to Redis */
+    redis_publish_call_started(session);
   }
   /* Handle user_transcript - user speech transcription */
   else if (strcmp(type_item->valuestring, "user_transcript") == 0) {
@@ -2947,8 +3394,8 @@ static void handle_websocket_message(struct elevenlabs_session *session,
                          text_item->valuestring);
         }
 
-        /* Publish transcript_chunk event for user (client) */
-        publish_transcript_chunk(session, text_item->valuestring, "client",
+        /* Publish transcript event for user (client) */
+        redis_publish_transcript(session, "client", text_item->valuestring,
                                  is_final);
       }
     } else {
@@ -2966,7 +3413,7 @@ static void handle_websocket_message(struct elevenlabs_session *session,
                          is_final, text_item->valuestring);
         }
 
-        publish_transcript_chunk(session, text_item->valuestring, "client",
+        redis_publish_transcript(session, "client", text_item->valuestring,
                                  is_final);
       }
     }
@@ -3001,9 +3448,10 @@ static void handle_websocket_message(struct elevenlabs_session *session,
                          text_item->valuestring);
         }
 
-        /* Publish transcript_chunk event for agent */
-        publish_transcript_chunk(session, text_item->valuestring, "agent",
+        /* Publish transcript event for agent + agent.response event */
+        redis_publish_transcript(session, "agent", text_item->valuestring,
                                  is_final);
+        redis_publish_agent_response(session, text_item->valuestring);
       }
     } else {
       /* Handle simple format */
@@ -3020,8 +3468,9 @@ static void handle_websocket_message(struct elevenlabs_session *session,
                          is_final, text_item->valuestring);
         }
 
-        publish_transcript_chunk(session, text_item->valuestring, "agent",
+        redis_publish_transcript(session, "agent", text_item->valuestring,
                                  is_final);
+        redis_publish_agent_response(session, text_item->valuestring);
       }
     }
   }
@@ -3062,6 +3511,9 @@ static void handle_websocket_message(struct elevenlabs_session *session,
       ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
                      "User interrupted AI speech - stopping playback\n");
     }
+
+    /* Publish agent.interrupted event to Redis */
+    redis_publish_agent_interrupted(session, NULL);
 
     /* Process interruption based on event_id */
     if (interruption_event && cJSON_IsObject(interruption_event)) {
@@ -3305,6 +3757,7 @@ static void quiesce_session_for_transfer(struct elevenlabs_session *session,
   session->stt_websocket_running = 0;
   session->hangup_after_playback = 0;
   session->hangup_monitor_running = 0;
+  ast_copy_string(session->end_reason, "transfer", sizeof(session->end_reason));
   ast_mutex_unlock(&session->session_lock);
 
   /* Wake playback thread if waiting */
@@ -3396,6 +3849,15 @@ static void fail_call_with_error(struct elevenlabs_session *session,
 
   ast_log(LOG_WARNING, "Failing current call/session: %s\n",
           reason ? reason : "(no reason)");
+
+  /* Publish error event to Redis */
+  redis_publish_error(session, "SESSION_FAILURE", reason ? reason : "unknown");
+
+  /* Set end reason */
+  ast_copy_string(session->end_reason, "error", sizeof(session->end_reason));
+
+  /* Publish call.ended with error reason */
+  redis_publish_call_ended(session, "error");
 
   /* Try to report failure to ElevenLabs if possible */
   if (tool_call_id) {
@@ -4955,9 +5417,6 @@ static int load_config(void) {
       ast_copy_string(redis_password, var->value, sizeof(redis_password));
     } else if (strcmp(var->name, "redis_enabled") == 0) {
       redis_enabled = ast_true(var->value);
-    } else if (strcmp(var->name, "redis_ingester_queue") == 0) {
-      ast_copy_string(redis_ingester_queue, var->value,
-                      sizeof(redis_ingester_queue));
     }
     var = var->next;
   }
@@ -5048,9 +5507,9 @@ static int load_config(void) {
   ast_config_destroy(cfg);
 
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
-                 "Redis: %s (host=%s, port=%d, db=%d, ingester_queue=%s)\n",
+                 "Redis: %s (host=%s, port=%d, db=%d)\n",
                  redis_enabled ? "enabled" : "disabled", redis_host, redis_port,
-                 redis_db, redis_ingester_queue);
+                 redis_db);
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
                  "Loaded %d agent configurations\n", agent_count);
   return 0;
