@@ -3,6 +3,15 @@
 ; Log level for the module: off, error, warning (default), notice, debug
 ; Can be changed at runtime via CLI: "elevenlabs loglevel [level]"
 loglevel=warning
+redis_enabled=true
+redis_host=10.24.2.103
+redis_port=6379
+redis_db=12
+; Redis audio streaming: sends real-time 100ms mulaw chunks (800 bytes each)
+; to Redis Streams: ast:call:{conv_id}:audio:in and ast:call:{conv_id}:audio:out
+; Uses XADD with MAXLEN ~ 150 (~15 seconds of audio per stream)
+; Default: false. Can be overridden per agent.
+redis_audio_streaming=false
 
 
 [adelina_hr]
@@ -14,6 +23,9 @@ elevenlabs_audio_frames_buffer_ms=240
 
 max_connection_attempts=3
 connection_timeout_seconds=10
+
+; Redis audio streaming override for this agent (optional, inherits from [general])
+; redis_audio_streaming=true
 
 ; STT configuration (optional - parallel streaming to external STT service)
 ; Audio is converted from 8kHz µ-law to 16kHz 16-bit PCM using Asterisk's

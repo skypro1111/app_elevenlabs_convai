@@ -117,6 +117,9 @@ struct agent_config {
   int enable_stt;
   char stt_websocket_url[512];
   int stt_buffer_duration_ms;
+
+  /* Redis audio streaming */
+  int redis_audio_streaming;
 };
 
 /*! \brief Audio queue item for buffering */
@@ -278,6 +281,19 @@ struct elevenlabs_session {
 
   /* Custom X-* headers from incoming call for transfer */
   struct custom_header *custom_headers;
+
+  /* Redis audio streaming (real-time 100ms chunks to Redis Streams) */
+  int redis_audio_enabled;
+  void *redis_audio_context; /* Dedicated redisContext* for audio thread */
+  unsigned char redis_inbound_buf[1600];  /* 200ms headroom at 8kHz mulaw */
+  size_t redis_inbound_buf_size;
+  ast_mutex_t redis_inbound_buf_lock;
+  unsigned char redis_outbound_buf[1600]; /* 200ms headroom at 8kHz mulaw */
+  size_t redis_outbound_buf_size;
+  ast_mutex_t redis_outbound_buf_lock;
+  pthread_t redis_audio_thread;
+  int redis_audio_thread_running;
+  int redis_audio_thread_started;
 };
 
 /*! \brief Global agent configurations */
@@ -291,6 +307,7 @@ static int redis_port = 6379;
 static int redis_db = 0;
 static char redis_password[256] = "";
 static int redis_enabled = 0;
+static int redis_audio_streaming_global = 0;
 
 /*! \brief Forward declarations */
 static int elevenlabs_exec(struct ast_channel *chan, const char *data);
@@ -395,6 +412,11 @@ static int add_audio_to_send_buffer(struct elevenlabs_session *session,
                                     const unsigned char *data, size_t length);
 static int should_send_buffer(struct elevenlabs_session *session);
 static int send_buffered_audio(struct elevenlabs_session *session);
+
+/* Redis audio streaming */
+static int connect_redis_audio(struct elevenlabs_session *session);
+static void disconnect_redis_audio(struct elevenlabs_session *session);
+static void *redis_audio_thread_func(void *arg);
 
 /* STT (Speech-to-Text) functions */
 static int init_stt_translator(struct elevenlabs_session *session);
@@ -640,16 +662,248 @@ static void disconnect_redis(struct elevenlabs_session *session) {
   }
 }
 
+/*! \brief Connect dedicated Redis context for audio streaming thread */
+static int connect_redis_audio(struct elevenlabs_session *session) {
+  struct timeval timeout = {5, 0};
+  redisContext *redis = NULL;
+  redisReply *reply = NULL;
+
+  if (!session) {
+    return -1;
+  }
+
+  if (!redis_enabled || !session->redis_audio_enabled) {
+    return 0;
+  }
+
+  /* Disconnect existing connection if any */
+  if (session->redis_audio_context) {
+    redisFree((redisContext *)session->redis_audio_context);
+    session->redis_audio_context = NULL;
+  }
+
+  redis = redisConnectWithTimeout(redis_host, redis_port, timeout);
+  if (!redis || redis->err) {
+    if (redis) {
+      ast_log(LOG_WARNING, "Redis audio connection error: %s\n", redis->errstr);
+      redisFree(redis);
+    } else {
+      ast_log(LOG_WARNING,
+              "Redis audio connection error: cannot allocate context\n");
+    }
+    session->redis_audio_context = NULL;
+    return -1;
+  }
+
+  /* Authenticate if password is set */
+  if (!ast_strlen_zero(redis_password)) {
+    reply = redisCommand(redis, "AUTH %s", redis_password);
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis audio authentication failed: %s\n",
+              reply ? reply->str : "no reply");
+      if (reply) {
+        freeReplyObject(reply);
+      }
+      redisFree(redis);
+      session->redis_audio_context = NULL;
+      return -1;
+    }
+    freeReplyObject(reply);
+  }
+
+  /* Select database */
+  if (redis_db != 0) {
+    reply = redisCommand(redis, "SELECT %d", redis_db);
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+      ast_log(LOG_WARNING, "Redis audio SELECT failed: %s\n",
+              reply ? reply->str : "no reply");
+      if (reply) {
+        freeReplyObject(reply);
+      }
+      redisFree(redis);
+      session->redis_audio_context = NULL;
+      return -1;
+    }
+    freeReplyObject(reply);
+  }
+
+  session->redis_audio_context = redis;
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Redis audio: dedicated connection established\n");
+  return 0;
+}
+
+/*! \brief Disconnect dedicated Redis audio context */
+static void disconnect_redis_audio(struct elevenlabs_session *session) {
+  if (!session) {
+    return;
+  }
+
+  if (session->redis_audio_context) {
+    ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                   "Redis audio: disconnecting dedicated connection\n");
+    redisFree((redisContext *)session->redis_audio_context);
+    session->redis_audio_context = NULL;
+  }
+}
+
+/*! \brief Redis audio streaming thread - sends 100ms mulaw chunks every 100ms */
+static void *redis_audio_thread_func(void *arg) {
+  struct elevenlabs_session *session = arg;
+  unsigned char inbound_chunk[800];
+  unsigned char outbound_chunk[800];
+  size_t inbound_available;
+  size_t outbound_available;
+  redisContext *redis;
+  redisReply *reply;
+  char key_in[256];
+  char key_out[256];
+  const char *conv_id;
+  struct timespec sleep_time;
+  int redis_errors = 0;
+
+  sleep_time.tv_sec = 0;
+  sleep_time.tv_nsec = 100000000; /* 100ms */
+
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Redis audio thread starting for channel %s\n",
+                 session->channel_name);
+
+  /* Connect dedicated Redis context for this thread */
+  if (connect_redis_audio(session) != 0) {
+    ast_log(LOG_WARNING,
+            "Redis audio: failed to connect - audio streaming disabled\n");
+    return NULL;
+  }
+
+  while (session->redis_audio_thread_running && session->session_active) {
+    nanosleep(&sleep_time, NULL);
+
+    if (!session->redis_audio_thread_running || !session->session_active) {
+      break;
+    }
+
+    /* Wait until conversation is properly initialized (stable conv_id) */
+    if (!session->started_event_sent) {
+      continue;
+    }
+
+    redis = (redisContext *)session->redis_audio_context;
+    if (!redis) {
+      /* Try reconnect */
+      if (connect_redis_audio(session) != 0) {
+        continue;
+      }
+      redis = (redisContext *)session->redis_audio_context;
+      if (!redis) {
+        continue;
+      }
+    }
+
+    conv_id = get_redis_conversation_id(session);
+    snprintf(key_in, sizeof(key_in), "ast:call:%s:audio:in", conv_id);
+    snprintf(key_out, sizeof(key_out), "ast:call:%s:audio:out", conv_id);
+
+    /* --- Inbound chunk (caller audio) --- */
+    memset(inbound_chunk, 0xFF, 800); /* Pre-fill with mulaw silence */
+    ast_mutex_lock(&session->redis_inbound_buf_lock);
+    inbound_available = session->redis_inbound_buf_size;
+    if (inbound_available > 800) {
+      inbound_available = 800;
+    }
+    if (inbound_available > 0) {
+      memcpy(inbound_chunk, session->redis_inbound_buf, inbound_available);
+      /* Shift remaining data left */
+      if (session->redis_inbound_buf_size > inbound_available) {
+        memmove(session->redis_inbound_buf,
+                session->redis_inbound_buf + inbound_available,
+                session->redis_inbound_buf_size - inbound_available);
+      }
+      session->redis_inbound_buf_size -= inbound_available;
+    }
+    ast_mutex_unlock(&session->redis_inbound_buf_lock);
+
+    /* --- Outbound chunk (agent audio) --- */
+    memset(outbound_chunk, 0xFF, 800); /* Pre-fill with mulaw silence */
+    ast_mutex_lock(&session->redis_outbound_buf_lock);
+    outbound_available = session->redis_outbound_buf_size;
+    if (outbound_available > 800) {
+      outbound_available = 800;
+    }
+    if (outbound_available > 0) {
+      memcpy(outbound_chunk, session->redis_outbound_buf, outbound_available);
+      if (session->redis_outbound_buf_size > outbound_available) {
+        memmove(session->redis_outbound_buf,
+                session->redis_outbound_buf + outbound_available,
+                session->redis_outbound_buf_size - outbound_available);
+      }
+      session->redis_outbound_buf_size -= outbound_available;
+    }
+    ast_mutex_unlock(&session->redis_outbound_buf_lock);
+
+    /* --- XADD inbound --- */
+    reply = redisCommand(redis, "XADD %s MAXLEN ~ 150 * data %b", key_in,
+                         inbound_chunk, (size_t)800);
+    if (reply) {
+      if (reply->type == REDIS_REPLY_ERROR) {
+        ast_log(LOG_WARNING, "Redis audio XADD in error: %s\n", reply->str);
+        redis_errors++;
+      } else {
+        redis_errors = 0;
+      }
+      freeReplyObject(reply);
+    } else {
+      ast_log(LOG_WARNING, "Redis audio XADD in failed: %s\n", redis->errstr);
+      redis_errors++;
+    }
+
+    /* --- XADD outbound --- */
+    reply = redisCommand(redis, "XADD %s MAXLEN ~ 150 * data %b", key_out,
+                         outbound_chunk, (size_t)800);
+    if (reply) {
+      if (reply->type == REDIS_REPLY_ERROR) {
+        ast_log(LOG_WARNING, "Redis audio XADD out error: %s\n", reply->str);
+        redis_errors++;
+      } else {
+        redis_errors = 0;
+      }
+      freeReplyObject(reply);
+    } else {
+      ast_log(LOG_WARNING, "Redis audio XADD out failed: %s\n", redis->errstr);
+      redis_errors++;
+    }
+
+    /* Reconnect on consecutive errors */
+    if (redis_errors >= 5) {
+      ast_log(LOG_WARNING,
+              "Redis audio: %d consecutive errors, reconnecting\n",
+              redis_errors);
+      disconnect_redis_audio(session);
+      if (connect_redis_audio(session) != 0) {
+        ast_log(LOG_WARNING,
+                "Redis audio: reconnection failed, will retry next cycle\n");
+      }
+      redis_errors = 0;
+    }
+  }
+
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Redis audio thread exiting for channel %s\n",
+                 session->channel_name);
+  return NULL;
+}
+
 /*! \brief Get current UTC timestamp in ISO-8601 format with milliseconds */
 static void get_utc_timestamp(char *buffer, size_t size) {
   struct timeval tv;
   struct tm tm_utc;
-  char time_str[64];
+  char time_str[24]; /* "YYYY-MM-DDTHH:MM:SS" = 19 chars + null */
 
   gettimeofday(&tv, NULL);
   gmtime_r(&tv.tv_sec, &tm_utc);
   strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm_utc);
-  snprintf(buffer, size, "%s.%03dZ", time_str, (int)(tv.tv_usec / 1000));
+  unsigned int msec = (unsigned int)(tv.tv_usec / 1000) % 1000u;
+  snprintf(buffer, size, "%s.%03uZ", time_str, msec);
 }
 
 /* ============================================================================
@@ -909,6 +1163,18 @@ static int redis_publish_call_ended(struct elevenlabs_session *session,
   reply = redisCommand(redis, "DEL %s", key);
   if (reply) {
     freeReplyObject(reply);
+  }
+
+  /* 3b. DEL audio stream keys if audio streaming was enabled */
+  if (session->redis_audio_enabled) {
+    char key_in[256];
+    char key_out[256];
+    snprintf(key_in, sizeof(key_in), "ast:call:%s:audio:in", conv_id);
+    snprintf(key_out, sizeof(key_out), "ast:call:%s:audio:out", conv_id);
+    reply = redisCommand(redis, "DEL %s %s", key_in, key_out);
+    if (reply) {
+      freeReplyObject(reply);
+    }
   }
 
   /* 4. PUBLISH ast:events */
@@ -1604,11 +1870,44 @@ static struct elevenlabs_session *create_session(struct ast_channel *chan,
     }
   }
 
+  /* Initialize Redis audio streaming if enabled */
+  session->redis_audio_enabled = 0;
+  session->redis_audio_context = NULL;
+  session->redis_audio_thread_started = 0;
+  session->redis_audio_thread_running = 0;
+  session->redis_inbound_buf_size = 0;
+  session->redis_outbound_buf_size = 0;
+
+  if (redis_enabled && config->redis_audio_streaming) {
+    ast_mutex_init(&session->redis_inbound_buf_lock);
+    ast_mutex_init(&session->redis_outbound_buf_lock);
+    session->redis_audio_enabled = 1;
+
+    /* Start Redis audio streaming thread */
+    session->redis_audio_thread_running = 1;
+    if (pthread_create(&session->redis_audio_thread, NULL,
+                       redis_audio_thread_func, session) != 0) {
+      ast_log(LOG_WARNING,
+              "Failed to create Redis audio thread - audio streaming disabled\n");
+      session->redis_audio_enabled = 0;
+      session->redis_audio_thread_running = 0;
+      ast_mutex_destroy(&session->redis_inbound_buf_lock);
+      ast_mutex_destroy(&session->redis_outbound_buf_lock);
+    } else {
+      session->redis_audio_thread_started = 1;
+      ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                     "Redis audio streaming enabled for channel %s\n",
+                     session->channel_name);
+    }
+  }
+
   ELEVENLABS_LOG(
       ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
-      "ElevenLabs session created successfully (STT: %s, Redis: %s)\n",
+      "ElevenLabs session created successfully (STT: %s, Redis: %s, "
+      "Redis audio: %s)\n",
       session->stt_enabled ? "enabled" : "disabled",
-      session->redis_context ? "connected" : "disabled");
+      session->redis_context ? "connected" : "disabled",
+      session->redis_audio_enabled ? "enabled" : "disabled");
   return session;
 }
 
@@ -1748,6 +2047,22 @@ static void destroy_session(struct elevenlabs_session *session) {
                    "STT WebSocket thread stopped\n");
   }
 
+  /* Stop Redis audio streaming thread */
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Step 3b: Stopping Redis audio thread (running=%d)\n",
+                 session->redis_audio_thread_running);
+  if (session->redis_audio_thread_running) {
+    session->redis_audio_thread_running = 0;
+    if (session->redis_audio_thread_started &&
+        !pthread_equal(pthread_self(), session->redis_audio_thread)) {
+      ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                     "Waiting for Redis audio thread to stop\n");
+      pthread_join(session->redis_audio_thread, NULL);
+      ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                     "Redis audio thread stopped\n");
+    }
+  }
+
   /* Detach framehook */
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
                  "Step 4: Detaching framehook (ID=%d)\n",
@@ -1853,9 +2168,18 @@ static void destroy_session(struct elevenlabs_session *session) {
     ast_mutex_destroy(&session->stt_send_buffer_lock);
   }
 
+  /* Cleanup Redis audio resources */
+  ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
+                 "Step 9b: Cleaning up Redis audio resources\n");
+  if (session->redis_audio_enabled) {
+    disconnect_redis_audio(session);
+    ast_mutex_destroy(&session->redis_inbound_buf_lock);
+    ast_mutex_destroy(&session->redis_outbound_buf_lock);
+  }
+
   /* Free custom headers */
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
-                 "Step 9b: Freeing custom headers\n");
+                 "Step 9c: Freeing custom headers\n");
   if (session->custom_headers) {
     free_custom_headers(session->custom_headers);
     session->custom_headers = NULL;
@@ -2060,23 +2384,22 @@ static struct ast_frame *framehook_callback(struct ast_channel *chan,
           send_stt_buffered_audio(session);
         }
       }
+
+      /* Copy inbound audio to Redis streaming buffer */
+      if (session->redis_audio_enabled && session->redis_audio_thread_running) {
+        ast_mutex_lock(&session->redis_inbound_buf_lock);
+        if (session->redis_inbound_buf_size + frame->datalen <=
+            sizeof(session->redis_inbound_buf)) {
+          memcpy(session->redis_inbound_buf + session->redis_inbound_buf_size,
+                 frame->data.ptr, frame->datalen);
+          session->redis_inbound_buf_size += frame->datalen;
+        }
+        ast_mutex_unlock(&session->redis_inbound_buf_lock);
+      }
     }
     break;
 
   case AST_FRAMEHOOK_EVENT_WRITE:
-    /* Outgoing audio to caller - normal processing for now */
-    if (frame->data.ptr && frame->datalen > 0) {
-      if (elevenlabs_loglevel >= ELEVENLABS_LOG_DEBUG) {
-        const char *format_name = ast_format_get_name(frame->subclass.format);
-        session->write_frame_count++;
-        ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
-                       "Framehook WRITE #%d: %s frame - %d bytes, %d samples\n",
-                       session->write_frame_count, format_name, frame->datalen,
-                       frame->samples);
-      }
-    }
-    /* Note: ElevenLabs audio is injected separately via ast_write in playback
-     * thread */
     break;
 
   default:
@@ -2205,7 +2528,7 @@ static void *websocket_thread_func(void *arg) {
       break;
     }
 
-    n = lws_service(session->ws_context, 100); /* 100ms timeout */
+    n = lws_service(session->ws_context, 50); /* 50ms timeout */
     if (n < 0) {
       session->last_error_code = n;
       ast_log(LOG_ERROR, "WebSocket service error: %d (%s)\n", n,
@@ -2564,6 +2887,18 @@ static void *playback_thread_func(void *arg) {
               ELEVENLABS_LOG(ELEVENLABS_LOG_DEBUG, LOG_DEBUG,
                              "Injected audio frame: %zu bytes, %zu samples\n",
                              chunk_size, chunk_size);
+            }
+
+            /* Copy outbound audio to Redis streaming buffer */
+            if (session->redis_audio_enabled && session->redis_audio_thread_running) {
+              ast_mutex_lock(&session->redis_outbound_buf_lock);
+              if (session->redis_outbound_buf_size + chunk_size <=
+                  sizeof(session->redis_outbound_buf)) {
+                memcpy(session->redis_outbound_buf + session->redis_outbound_buf_size,
+                       audio_ptr, chunk_size);
+                session->redis_outbound_buf_size += chunk_size;
+              }
+              ast_mutex_unlock(&session->redis_outbound_buf_lock);
             }
           }
         } else {
@@ -5417,6 +5752,8 @@ static int load_config(void) {
       ast_copy_string(redis_password, var->value, sizeof(redis_password));
     } else if (strcmp(var->name, "redis_enabled") == 0) {
       redis_enabled = ast_true(var->value);
+    } else if (strcmp(var->name, "redis_audio_streaming") == 0) {
+      redis_audio_streaming_global = ast_true(var->value);
     }
     var = var->next;
   }
@@ -5445,6 +5782,9 @@ static int load_config(void) {
     agent_configs[i].stt_websocket_url[0] = '\0';
     agent_configs[i].stt_buffer_duration_ms =
         0; /* 0 = same as elevenlabs buffer */
+
+    /* Redis audio streaming default (inherits from global) */
+    agent_configs[i].redis_audio_streaming = redis_audio_streaming_global;
 
     var = ast_variable_browse(cfg, category);
     while (var) {
@@ -5488,6 +5828,8 @@ static int load_config(void) {
                         sizeof(agent_configs[i].stt_websocket_url));
       } else if (strcmp(var->name, "stt_buffer_duration_ms") == 0) {
         agent_configs[i].stt_buffer_duration_ms = atoi(var->value);
+      } else if (strcmp(var->name, "redis_audio_streaming") == 0) {
+        agent_configs[i].redis_audio_streaming = ast_true(var->value);
       }
       var = var->next;
     }
@@ -5507,9 +5849,10 @@ static int load_config(void) {
   ast_config_destroy(cfg);
 
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
-                 "Redis: %s (host=%s, port=%d, db=%d)\n",
+                 "Redis: %s (host=%s, port=%d, db=%d, audio_streaming=%s)\n",
                  redis_enabled ? "enabled" : "disabled", redis_host, redis_port,
-                 redis_db);
+                 redis_db,
+                 redis_audio_streaming_global ? "enabled" : "disabled");
   ELEVENLABS_LOG(ELEVENLABS_LOG_NOTICE, LOG_NOTICE,
                  "Loaded %d agent configurations\n", agent_count);
   return 0;
